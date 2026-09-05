@@ -292,6 +292,36 @@ check_3_3() {
   bring_up_compose "$box" || true
   bring_up_compose "$fork_id" || true
 
+  # #447: a fork clones the whole volume byte for byte, `.kizuki/vault-id`
+  # included, so `ensureVaultId` (packages/core/src/serve/vault-id.ts) never
+  # sees an absent file to mint a fresh id for -- it mints only when the
+  # file is missing, and the file is never missing on a fork. `ensureVaultId`
+  # itself is only ever called from `kizuki init` (packages/cli/src/commands/
+  # init.ts), never from `kizuki serve`'s own startup -- confirmed directly:
+  # removing the file and restarting the `kizuki` service left it exited
+  # with `error: vault identity missing: /vault; run: kizuki init /vault`
+  # (packages/cli/src/context.ts assertVault), not a freshly minted id.
+  # Reset it explicitly on the fork side only (never the original: a
+  # restart or resume must not change an existing box's id) by removing the
+  # file and then re-running `kizuki init` the same way entrypoint.sh does
+  # on first boot, through a throwaway `docker compose run` that overrides
+  # the image's entrypoint rather than the live `kizuki-1` service -- the
+  # already-running service needs no restart, since this check only ever
+  # reads the id back from disk, never from a running process's own
+  # possibly-cached view of it. `.kizuki` already existing makes `initVault`
+  # take its idempotent repair path (packages/core/src/vault/init.ts
+  # isRepairableVault), not the `--adopt`-requiring "nonempty vault" path,
+  # and confirmed directly not to race the live service's own open ledger
+  # handle (no SQLITE_BUSY, health still ok:true immediately after). This is
+  # the provisioning-side fix named in issue #447 -- it protects only boxes
+  # forked through this path, not a clone made any other way; the durable
+  # fix (first boot after a clone detecting it is on a new machine) is out
+  # of scope here.
+  api POST "/boxes/$fork_id/commands" \
+    '{"command":"cd /home/user/kizuki-src/deploy && docker compose exec -T kizuki rm -f /vault/.kizuki/vault-id"}' >/dev/null
+  api POST "/boxes/$fork_id/commands" \
+    '{"command":"cd /home/user/kizuki-src/deploy && docker compose run --rm --entrypoint \"\" -T kizuki kizuki init /vault --no-default 2>&1 | tail -20"}' >/dev/null
+
   local original_vault_id fork_vault_id
   original_vault_id="$(box_vault_id "$box")"
   fork_vault_id="$(box_vault_id "$fork_id")"
