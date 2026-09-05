@@ -86,15 +86,44 @@ box_event_count() {
 
 # Brings the compose stack up on a box that is freshly resumed or forked,
 # where no container survives from before (see the M3 finding in
-# docs/deploy-box-tailscale.md: only images and named volumes do). Retries
-# once past the "Conflict ... name ... already in use" race the first
-# attempt reliably hits right after a resume/fork, by removing the
-# half-created containers and trying again.
+# docs/deploy-box-tailscale.md: only images and named volumes do).
+#
+# #446: right after a resume, dockerd reconciles containers on its own
+# before this function's `up -d` ever runs, and can win the race to create
+# "/deploy-tailscale-1" with the secret mount not yet applied -- a
+# container in that state can never authenticate and will never recover.
+# Reconciling with `docker compose down` first (never `-v`, which would
+# destroy the vault volume) on every attempt makes compose own the
+# container set instead of racing dockerd for it. That still leaves the
+# case where dockerd wins the very next race before `up -d` finishes, so
+# each attempt also reads the tailscale service's own logs afterward and
+# treats the "missing secret file" symptom as a container to remove and
+# replace, not as one to retry against. `up -d` finishing with neither
+# symptom is still not proof both services actually stayed up (observed:
+# a real proof run once left `kizuki` unreachable for the rest of its 120s
+# poll with no Conflict and no secret error in either command's own
+# output), so the last step before declaring convergence confirms both
+# services report `running`, not just that `up` returned without the two
+# known symptoms.
 bring_up_compose() {
-  local box="$1" up_attempt up_resp
-  for up_attempt in 1 2 3; do
+  local box="$1" attempt up_resp ts_logs running_count
+  for attempt in 1 2 3 4 5; do
+    api POST "/boxes/$box/commands" \
+      '{"command":"cd /home/user/kizuki-src/deploy && docker compose down --remove-orphans 2>&1 | tail -20"}' >/dev/null
+
     up_resp="$(api POST "/boxes/$box/commands" \
       '{"command":"cd /home/user/kizuki-src/deploy && KIZUKI_TS_AUTHKEY_FILE=/home/user/.config/kizuki/ts-authkey docker compose up -d 2>&1 | tail -20"}')"
+
+    ts_logs="$(api POST "/boxes/$box/commands" \
+      '{"command":"cd /home/user/kizuki-src/deploy && docker compose logs tailscale 2>&1 | tail -20"}' | cmd_stdout)"
+    case "$ts_logs" in
+      *'missing secret file'*)
+        api POST "/boxes/$box/commands" \
+          '{"command":"docker rm -f deploy-tailscale-1 deploy-kizuki-1 2>/dev/null || true"}' >/dev/null
+        sleep 3
+        continue
+        ;;
+    esac
     case "$up_resp" in
       *Conflict*)
         api POST "/boxes/$box/commands" \
@@ -102,8 +131,12 @@ bring_up_compose() {
         sleep 3
         continue
         ;;
-      *) return 0 ;;
     esac
+
+    running_count="$(api POST "/boxes/$box/commands" \
+      '{"command":"cd /home/user/kizuki-src/deploy && docker compose ps --status running -q | wc -l"}' | cmd_stdout)"
+    [ "$running_count" = "2" ] && return 0
+    sleep 3
   done
   return 1
 }
