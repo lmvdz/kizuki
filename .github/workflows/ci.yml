@@ -50,3 +50,27 @@ jobs:
         run: bun run ci:secrets
       - name: gitleaks
         run: bash scripts/ci-gitleaks.sh
+  # Static properties of the deploy stack: image pinning, no auth key in the
+  # tree or in the environment, no own network, empty capabilities. Needs no
+  # Docker daemon and is deterministic.
+  #
+  # `deploy/proof/container.sh` deliberately does NOT run here yet. It builds
+  # and runs the image, and on a Docker daemon under load it flakes with
+  # symptoms that look like defects but are contention: "first import exited
+  # non-zero", "database is locked", and a transient doctor read reporting an
+  # orphan receipt. Across five local runs it passed once. Whether that is
+  # purely local contention or a real race has not been established on a clean
+  # runner, so gating on it would risk a red main for the wrong reason. Add the
+  # step once it has been observed green here several times in a row.
+  compose-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: keep origin/main only
+        run: bash scripts/ci-restrict-origin-refs.sh
+      - name: compose lint proof
+        run: bash deploy/proof/compose-lint.sh
