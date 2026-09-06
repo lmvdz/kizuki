@@ -119,6 +119,10 @@ main() {
   check_2_4
   check_2_5
   check_2_13
+  # Every check passed. This line is the only positive signal a
+  # truncated or piped read can rely on: judge a run by its
+  # presence, never by the absence of a FAIL line.
+  printf 'ALL CHECKS PASSED\n'
 }
 
 main "$@"

@@ -426,6 +426,10 @@ main() {
   local remaining
   remaining="$(api GET /boxes)"
   echo "fleet after cleanup: $remaining" >&2
+  # Only a run with no FAIL and no BLOCKED earns the verdict. This is
+  # the only positive signal a truncated or piped read can rely on:
+  # judge a run by its presence, never by the absence of a FAIL line.
+  if [ "$ANY_FAIL" -eq 0 ]; then printf 'ALL CHECKS PASSED\n'; fi
   exit "$ANY_FAIL"
 }
 

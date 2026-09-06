@@ -179,6 +179,42 @@ fields, retention and sensitivity floor they intend, and grant it with
 provisioning step; automating it would mean the box guessing the owner's
 intended policy, which is exactly the thing consent exists to prevent.
 
+### Reading a proof result
+
+Every proof under `deploy/proof/` ends with a single line, `ALL CHECKS
+PASSED`, printed only when no check failed. On `tailnet.sh` and `box.sh`,
+whose `fail()` and `blocked()` accumulate into `ANY_FAIL` rather than exiting,
+the line is guarded on that variable, so a BLOCKED check withholds it too.
+
+**Judge a run by the presence of that line, never by the absence of a FAIL.**
+Absence-based reasoning breaks in two ways that both occurred repeatedly while
+this tree was being built:
+
+- **A trailing pipe discards the exit status.** `bash proof.sh | tail` and
+  `wsl.exe ... | tail` report `tail`'s status, which is zero whatever the
+  proof did. Measured on all four scripts. Direct invocation is unaffected,
+  which is why CI is safe: it runs `bash deploy/proof/<name>.sh` with no pipe.
+- **`tail` can truncate the FAIL line.** Because `fail()` exits immediately in
+  `container.sh` and `compose-lint.sh`, a failing run's FAIL is usually the
+  last line — so `tail` usually shows it. That is worse than never showing it,
+  because it builds confidence in a read that is unsound whenever a run dies
+  for some other reason.
+
+So capture the status without a pipe:
+
+```
+bash deploy/proof/container.sh > /tmp/proof.log 2>&1; echo "exit=$?"
+```
+
+then read the log. Setting `pipefail` in the calling shell also restores a
+correct status if a pipe is unavoidable.
+
+`deploy/proof/verdict-selfcheck.sh` proves the marker cannot lie: it asserts
+the line appears on a real passing run, that it is absent from every proof
+when a check fails (each run against a copy with a forced failure injected
+into its first check, so no container is built, no tailnet joined and no box
+created), and that the two accumulating proofs guard it on `ANY_FAIL`.
+
 ### M2 Tailnet access
 
 Files: `deploy/compose.yml` (tailscale service), `deploy/tailscale/serve.json`,

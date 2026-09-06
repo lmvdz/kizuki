@@ -74,3 +74,5 @@ jobs:
         run: bash scripts/ci-restrict-origin-refs.sh
       - name: compose lint proof
         run: bash deploy/proof/compose-lint.sh
+      - name: proof verdict self-check
+        run: bash deploy/proof/verdict-selfcheck.sh
