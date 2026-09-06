@@ -65,6 +65,22 @@ cmd_stdout() {
   printf '%s' "$raw"
 }
 
+# The commands endpoint's own stderr field, read the same way bootstrap.sh's
+# run_cmd reads it (both fields sit between "stderr" and "stdoutTruncated").
+cmd_stderr() {
+  local raw
+  raw="$(sed -n 's/.*"stderr":"\(.*\)","stdoutTruncated".*/\1/p' | sed 's/\\"/"/g')"
+  while [ "${raw: -2}" = '\n' ]; do
+    raw="${raw%\\n}"
+  done
+  printf '%s' "$raw"
+}
+
+# The commands endpoint's own top-level "success" boolean -- true only when
+# the command it ran exited 0 (see bootstrap.sh's run_cmd, which uses the
+# same field to decide whether to treat a response as a failure).
+cmd_success() { sed -n 's/.*"success":\([a-z]*\).*/\1/p' | head -1; }
+
 box_state() { api GET "/boxes/$1" | json_str state; }
 box_vault_id() {
   # /vault is a path inside the kizuki container's own volume, not on the
@@ -193,10 +209,61 @@ check_3_2() {
     return
   fi
   local before after
-  # Import the fixtures once so there is ledger state to lose, matching
-  # container.sh check 1.6/1.8's own "events=3" signal.
+
+  # Issue #3: an ungranted import is refused fail-closed under the
+  # source-consent model (packages/core/src/ledger/connections.ts
+  # registerConnection sets consent_required=1 on every freshly enrolled
+  # connection), the same defect container.sh check_1_6 fixed for the
+  # container proof. Negative case first, inline, so a regression that
+  # silently removed the consent gate turns this refusal into a success and
+  # fails the check, rather than the check never noticing.
+  local refuse_resp refuse_success refuse_stderr
+  refuse_resp="$(api POST "/boxes/$box/commands" \
+    '{"command":"cd /home/user/kizuki-src/deploy && docker compose exec -T kizuki kizuki import markdown-folder --source /fixtures --vault /vault"}')"
+  refuse_success="$(printf '%s' "$refuse_resp" | cmd_success)"
+  refuse_stderr="$(printf '%s' "$refuse_resp" | cmd_stderr)"
+  if [ "$refuse_success" = "true" ]; then
+    fail 3.2 stop-resume-keeps-vault "import with no grant unexpectedly succeeded"
+    return
+  fi
+  case "$refuse_stderr" in
+    *consent-required*) ;;
+    *) fail 3.2 stop-resume-keeps-vault "refusal missing 'consent-required' hint: $refuse_stderr"; return ;;
+  esac
+
+  # Grant consent through the documented public path (packages/cli/src/
+  # commands/import.ts), the full purpose list container.sh check_1_6 uses
+  # -- a narrower list makes a later export check fail with
+  # source_export_denied. The policy file must satisfy
+  # packages/cli/src/source-consent.ts readSourcePolicy's custody rules
+  # (owner-owned, no group/other write, no symlink). /tmp is this
+  # read-only-rootfs kizuki service's only writable path (deploy/compose.yml:
+  # read_only: true, tmpfs: [/tmp], the same shape as the container proof's
+  # image), and its tmpfs mount is root-owned with the sticky bit set, which
+  # that custody check treats as trusted -- identical reasoning to
+  # container.sh check_1_6's own use of /tmp. The policy content travels as
+  # base64 so it never has to survive this script's own JSON-in-JSON command
+  # escaping as a literal quote.
+  local policy_json policy_b64
+  policy_json='{"purposes":["capture","recall","session","correction","audit","derive","extract","export"],"allowed_fields":["text","subjects","attachments","metadata"],"retention":"persistent_owned_until_revoked","egress":"local_only","sensitivity_floor":"private"}'
+  policy_b64="$(printf '%s' "$policy_json" | base64 -w0)"
   api POST "/boxes/$box/commands" \
-    '{"command":"cd /home/user/kizuki-src/deploy && docker compose exec -T kizuki kizuki import markdown-folder --source /fixtures --vault /vault"}' >/dev/null
+    "{\"command\":\"cd /home/user/kizuki-src/deploy && docker compose exec -T kizuki sh -c 'umask 077; printf %s $policy_b64 | base64 -d > /tmp/fixtures-policy.json'\"}" >/dev/null
+
+  local grant_resp grant_success grant_stdout
+  grant_resp="$(api POST "/boxes/$box/commands" \
+    '{"command":"cd /home/user/kizuki-src/deploy && docker compose exec -T kizuki kizuki import markdown-folder --source /fixtures --vault /vault --policy /tmp/fixtures-policy.json --expected-revision 0 --operation-id proof-grant-fixtures"}')"
+  grant_success="$(printf '%s' "$grant_resp" | cmd_success)"
+  grant_stdout="$(printf '%s' "$grant_resp" | cmd_stdout)"
+  if [ "$grant_success" != "true" ]; then
+    fail 3.2 stop-resume-keeps-vault "granted import exited non-zero: $grant_stdout"
+    return
+  fi
+  case "$grant_stdout" in
+    *events_stored=3*) ;;
+    *) fail 3.2 stop-resume-keeps-vault "granted import stdout missing events_stored=3: $grant_stdout"; return ;;
+  esac
+
   before="$(box_event_count "$box")"
   case "$before" in
     events=3) ;;
