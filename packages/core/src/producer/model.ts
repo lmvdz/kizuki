@@ -5,6 +5,7 @@ import {
   PRODUCER_CONTRACT_MINOR,
 } from "../contracts/producer";
 import type {
+  ClaimDiagnostic,
   ClaimDraft,
   ClaimSummary,
   DroppedDraft,
@@ -28,7 +29,9 @@ import { isRfc3339 } from "../util/time";
 import { isNonEmptyString, isPlainObject } from "../util/validate";
 import { escapeFenceText, hasFenceLeak, newFenceNonce } from "./fence";
 import { buildExtractionMessages } from "./prompt";
+import { diagnosticShape } from "./diagnostics";
 import {
+  MAX_CLAIM_REJECT_FRACTION,
   MAX_EVENT_ID_CHARS,
   containsVerbatimCapture,
   parseExtractResponse,
@@ -496,6 +499,18 @@ export function createModelProducerPort(
           });
           return { status: "rejected", reason: "schema_invalid", usage, diagnostic: parsed.diagnostic };
         }
+        // A claim already dropped below the ceiling in parseExtractResponse
+        // (bad shape or an out-of-enum field) is counted here, never silent
+        // (#452, #442).
+        for (const diagnostic of parsed.rejected ?? []) {
+          const item: DroppedDraft = { reason: "claim_invalid", diagnostic };
+          dropped.push(item);
+          ctx.logger({
+            level: "warn",
+            message: "extract_claim_rejected",
+            detail: { diagnostic },
+          });
+        }
 
         const batchEventIds = new Set(batch.events.map((event) => event.event_id));
         const subjectsByEvent = new Map(
@@ -506,10 +521,16 @@ export function createModelProducerPort(
         );
         const sources = batch.events.map((event) => event.text);
 
+        type ClaimOutcome =
+          | { readonly kind: "keep" }
+          | { readonly kind: "provenance" }
+          | { readonly kind: "unknown_predicate"; readonly predicate: string }
+          | { readonly kind: "unknown_subject"; readonly subject: string };
+        const outcomes: ClaimOutcome[] = [];
         for (const [index, draft] of parsed.claims.entries()) {
-          if (!draft.event_ids.every((id) => batchEventIds.has(id))) {
-            return { status: "rejected", reason: "provenance_not_cited", usage };
-          }
+          // Verbatim capture stays an unconditional whole-call rejection: it
+          // is a data-exfiltration guard, not a shape slip a ceiling should
+          // tolerate.
           if (containsVerbatimCapture(draft.body, sources)) {
             ctx.logger({
               level: "warn",
@@ -519,32 +540,71 @@ export function createModelProducerPort(
             return { status: "rejected", reason: "schema_invalid", usage,
               diagnostic: { stage: "claims", rule: "verbatim", field: "body", shape: "string", claim_index: index, claim_count: parsed.claims.length } };
           }
-        }
-        for (const draft of parsed.claims) {
+          if (!draft.event_ids.every((id) => batchEventIds.has(id))) {
+            outcomes.push({ kind: "provenance" });
+            continue;
+          }
           if (!predicates.has(draft.predicate)) {
-            const item: DroppedDraft = {
-              reason: "unknown_predicate",
-              predicate: draft.predicate,
-              event_ids: [...draft.event_ids],
-            };
-            dropped.push(item);
-            drop(item);
+            outcomes.push({ kind: "unknown_predicate", predicate: draft.predicate });
             continue;
           }
           if (!batchSubjects.has(draft.subject)) {
-            const item: DroppedDraft = {
-              reason: "unknown_subject",
-              subject: draft.subject,
-              event_ids: [...draft.event_ids],
-            };
-            dropped.push(item);
-            drop(item);
+            outcomes.push({ kind: "unknown_subject", subject: draft.subject });
             continue;
           }
           if (!draft.event_ids.every((id) => subjectsByEvent.get(id)?.has(draft.subject) === true)) {
-            return { status: "rejected", reason: "provenance_not_cited", usage };
+            outcomes.push({ kind: "provenance" });
+            continue;
           }
-          claims.push(draft);
+          outcomes.push({ kind: "keep" });
+        }
+
+        // A citation naming an event outside the batch, or naming an event
+        // that never mentions the claimed subject, is dropped alone below
+        // the ceiling; at or above it the whole call is refused as before
+        // (#452's second measured trigger: a mis-transcribed event id).
+        const provenanceBad = outcomes.filter((outcome) => outcome.kind === "provenance").length;
+        if (parsed.claims.length > 0 && provenanceBad / parsed.claims.length >= MAX_CLAIM_REJECT_FRACTION) {
+          return { status: "rejected", reason: "provenance_not_cited", usage };
+        }
+
+        for (const [index, outcome] of outcomes.entries()) {
+          const draft = parsed.claims[index]!;
+          switch (outcome.kind) {
+            case "keep":
+              claims.push(draft);
+              break;
+            case "provenance": {
+              const diagnostic: ClaimDiagnostic = {
+                stage: "claims", rule: "event_ids", field: "event_ids",
+                shape: diagnosticShape(draft.event_ids), claim_index: index, claim_count: parsed.claims.length,
+              };
+              const item: DroppedDraft = { reason: "claim_invalid", diagnostic };
+              dropped.push(item);
+              ctx.logger({ level: "warn", message: "extract_claim_rejected", detail: { diagnostic } });
+              break;
+            }
+            case "unknown_predicate": {
+              const item: DroppedDraft = {
+                reason: "unknown_predicate",
+                predicate: outcome.predicate,
+                event_ids: [...draft.event_ids],
+              };
+              dropped.push(item);
+              drop(item);
+              break;
+            }
+            case "unknown_subject": {
+              const item: DroppedDraft = {
+                reason: "unknown_subject",
+                subject: outcome.subject,
+                event_ids: [...draft.event_ids],
+              };
+              dropped.push(item);
+              drop(item);
+              break;
+            }
+          }
         }
       }
 

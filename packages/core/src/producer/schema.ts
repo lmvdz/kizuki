@@ -19,6 +19,15 @@ export const MAX_SUBJECT_CHARS = 256;
 export const MAX_PREDICATE_CHARS = 128;
 export const MAX_EVENT_ID_CHARS = 64;
 export const MAX_EVENT_IDS_PER_CLAIM = 32;
+/**
+ * At or above this fraction of a response's claims failing validation, the
+ * whole response is refused rather than laundered one claim at a time
+ * (issue #452). Chosen at one half: the measured real-world defect rate is
+ * one claim in 13-21 per batch (about 5-8%), far below this line, while a
+ * response that is at least half invalid is treated the same as it is
+ * today -- a wholesale failure, not a partial extraction.
+ */
+export const MAX_CLAIM_REJECT_FRACTION = 0.5;
 
 const RESPONSE_KEYS = ["claims"] as const;
 const CLAIM_KEYS = [
@@ -54,7 +63,7 @@ const SENSITIVITIES: ReadonlySet<string> = new Set<Sensitivity>([
 const CODE_FENCE = /^```(?:json)?\s*\n([\s\S]*?)\n```\s*$/;
 
 export type ParseExtractResult =
-  | { ok: true; claims: ClaimDraft[] }
+  | { ok: true; claims: ClaimDraft[]; rejected?: ClaimDiagnostic[] }
   | { ok: false; detail: string; diagnostic: ClaimDiagnostic };
 type SchemaFailure = Extract<ParseExtractResult, { ok: false }>;
 
@@ -199,12 +208,25 @@ export function parseExtractResponse(text: string): ParseExtractResult {
   }
 
   const claims: ClaimDraft[] = [];
+  const failures: SchemaFailure[] = [];
   for (const [index, raw] of rawClaims.entries()) {
     const claim = readClaim(raw, index, rawClaims.length);
-    if ("ok" in claim) return claim;
+    if ("ok" in claim) { failures.push(claim); continue; }
     claims.push(claim);
   }
-  return { ok: true, claims };
+  // A claim that fails validation is dropped, not repaired (AGENTS.md
+  // invariant 8: fail closed on missing or invalid sensitivity, for
+  // example). Its well-formed siblings are not discarded with it, unless
+  // rejections are so pervasive that the response is wholesale garbage; at
+  // or above the ceiling this reports the same failure the caller would
+  // have seen before per-claim rejection existed (the first offending
+  // claim, in order).
+  if (rawClaims.length > 0 && failures.length / rawClaims.length >= MAX_CLAIM_REJECT_FRACTION) {
+    return failures[0]!;
+  }
+  return failures.length === 0
+    ? { ok: true, claims }
+    : { ok: true, claims, rejected: failures.map((failure) => failure.diagnostic) };
 }
 
 /** A verbatim run this long from any quoted record makes a body a capture, not prose. */

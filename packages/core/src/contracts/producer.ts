@@ -105,6 +105,7 @@ export const DROPPED_DRAFT_REASONS = [
   "unknown_predicate",
   "unknown_subject",
   "event_too_large",
+  "claim_invalid",
 ] as const;
 export type DroppedDraftReason = (typeof DROPPED_DRAFT_REASONS)[number];
 
@@ -128,6 +129,15 @@ export type DroppedDraft =
       readonly reason: "event_too_large";
       readonly event_id: string;
       readonly chars: number;
+    }
+  | {
+      /**
+       * A claim failed shape or provenance validation and was dropped alone
+       * rather than discarding its well-formed siblings (#452). The
+       * diagnostic names the field and rule, never the offending value.
+       */
+      readonly reason: "claim_invalid";
+      readonly diagnostic: ClaimDiagnostic;
     };
 
 export type ProduceResult =
