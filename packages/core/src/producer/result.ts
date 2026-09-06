@@ -71,6 +71,13 @@ function readDroppedV1(value: unknown): DroppedDraft[] | undefined {
       integer(item.chars)) {
       dropped.push({ reason: item.reason, event_id: item.event_id, chars: item.chars });
     }
+    else if (item.reason === "claim_invalid" && exact(item, ["reason", "diagnostic"])) {
+      const diagnostic = readProducerDiagnostic(item.diagnostic);
+      if (diagnostic === undefined || diagnostic.stage !== "claims") {
+        return undefined;
+      }
+      dropped.push({ reason: item.reason, diagnostic });
+    }
     else {
       return undefined;
     }

@@ -429,6 +429,25 @@ describe("write pass", () => {
       }),
     });
     expect(dropped.claims_rejected).toEqual({ unknown_predicate: 1 });
+
+    // A claim dropped alone for failing schema or provenance validation
+    // (#452) is counted through the exact same boundary, never silently.
+    putEvent(db, { source_record_id: "claim-invalid" });
+    const claimInvalid = await runWritePass(db, path, {
+      budget: createBudgetTracker({ canon_writes_per_run: 8 }),
+      model_ref: "kizuki.llm.openai-compatible:synthetic@local",
+      claims: { db },
+      producer: stubProducer({
+        status: "ok",
+        claims: [],
+        usage: { calls: 1, input_tokens: 3, output_tokens: 0 },
+        dropped: [{
+          reason: "claim_invalid",
+          diagnostic: { stage: "claims", rule: "enum", field: "sensitivity", shape: "string", claim_index: 2, claim_count: 5 },
+        }],
+      }),
+    });
+    expect(claimInvalid.claims_rejected).toEqual({ claim_invalid: 1 });
     db.close();
   });
 

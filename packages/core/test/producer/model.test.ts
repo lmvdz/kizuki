@@ -169,6 +169,87 @@ describe("kizuki.producer.model", () => {
     });
   });
 
+  test("one claim with an out-of-enum field is dropped alone and counted, siblings survive (#452)", async () => {
+    const llm = scriptedLlm(() =>
+      responseText([
+        draft({ object: "runs partnerships at Acme" }),
+        draft({ object: "owns the renewal", sensitivity: "professional" as never }),
+        draft({ object: "leads the Lisbon office" }),
+      ]),
+    );
+    await withProducer(llm, async (producer, logs) => {
+      const result = await producer.produce(input([GRACE_EVENT]));
+      expect(result.status).toBe("ok");
+      if (result.status !== "ok") return;
+      expect(result.claims).toEqual([
+        draft({ object: "runs partnerships at Acme" }),
+        draft({ object: "leads the Lisbon office" }),
+      ]);
+      expect(result.dropped).toEqual([
+        {
+          reason: "claim_invalid",
+          diagnostic: { stage: "claims", rule: "enum", field: "sensitivity", shape: "string", claim_index: 1, claim_count: 3 },
+        },
+      ]);
+      expect(logs).toContainEqual({
+        level: "warn",
+        message: "extract_claim_rejected",
+        detail: {
+          diagnostic: { stage: "claims", rule: "enum", field: "sensitivity", shape: "string", claim_index: 1, claim_count: 3 },
+        },
+      });
+      expect(JSON.stringify(logs)).not.toContain("professional");
+    });
+  });
+
+  test("at or above the reject ceiling, invalid claims still discard the whole call", async () => {
+    const llm = scriptedLlm(() =>
+      responseText([
+        draft(),
+        draft({ sensitivity: "professional" as never }),
+        draft({ object: "b" }),
+        draft({ object: "c", sensitivity: "professional" as never }),
+      ]),
+    );
+    await withProducer(llm, async (producer) => {
+      const result = await producer.produce(input([GRACE_EVENT]));
+      expect(result.status).toBe("rejected");
+      if (result.status === "rejected") expect(result.reason).toBe("schema_invalid");
+    });
+  });
+
+  test("a claim citing an event outside the batch is dropped alone below the ceiling, siblings survive", async () => {
+    const llm = scriptedLlm(() =>
+      responseText([
+        draft({ object: "runs partnerships at Acme" }),
+        draft({ object: "borrows a citation", event_ids: [GRACE_EVENT.event_id, "01JFABRICATED"] }),
+        draft({ object: "leads the Lisbon office" }),
+      ]),
+    );
+    await withProducer(llm, async (producer, logs) => {
+      const result = await producer.produce(input([GRACE_EVENT]));
+      expect(result.status).toBe("ok");
+      if (result.status !== "ok") return;
+      expect(result.claims).toEqual([
+        draft({ object: "runs partnerships at Acme" }),
+        draft({ object: "leads the Lisbon office" }),
+      ]);
+      expect(result.dropped).toEqual([
+        {
+          reason: "claim_invalid",
+          diagnostic: { stage: "claims", rule: "event_ids", field: "event_ids", shape: "array", claim_index: 1, claim_count: 3 },
+        },
+      ]);
+      expect(logs).toContainEqual({
+        level: "warn",
+        message: "extract_claim_rejected",
+        detail: {
+          diagnostic: { stage: "claims", rule: "event_ids", field: "event_ids", shape: "array", claim_index: 1, claim_count: 3 },
+        },
+      });
+    });
+  });
+
   test("citing an event outside the input discards the whole call", async () => {
     const llm = scriptedLlm(() =>
       responseText([draft(), draft({ event_ids: [GRACE_EVENT.event_id, "01JFABRICATED"] })]),

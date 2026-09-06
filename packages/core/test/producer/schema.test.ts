@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   MAX_BODY_CHARS,
   MAX_CLAIMS_PER_RESPONSE,
+  MAX_CLAIM_REJECT_FRACTION,
   MAX_OBJECT_CHARS,
   MAX_RESPONSE_CHARS,
   containsVerbatimCapture,
@@ -19,6 +20,31 @@ describe("strict extraction schema", () => {
   test("a well-formed response parses to drafts", () => {
     const result = parseExtractResponse(responseText([draft()]));
     expect(result).toEqual({ ok: true, claims: [draft()] });
+  });
+
+  test("one invalid claim among several is dropped alone, not the whole batch (#452)", () => {
+    const good1 = draft({ object: "runs partnerships at Acme" });
+    const good2 = draft({ object: "leads the Lisbon office" });
+    const good3 = draft({ object: "owns the renewal" });
+    const bad = draft({ sensitivity: "professional" as never });
+    const result = parseExtractResponse(responseText([good1, bad, good2, good3]));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.claims).toEqual([good1, good2, good3]);
+    expect(result.rejected).toEqual([
+      { stage: "claims", rule: "enum", field: "sensitivity", shape: "string", claim_index: 1, claim_count: 4 },
+    ]);
+  });
+
+  test("at or above the reject ceiling the whole response is refused, not laundered one claim at a time", () => {
+    const good = draft();
+    const bad = draft({ sensitivity: "professional" as never });
+    // Four claims, two invalid: exactly at MAX_CLAIM_REJECT_FRACTION (0.5).
+    expect(MAX_CLAIM_REJECT_FRACTION).toBe(0.5);
+    const result = parseExtractResponse(responseText([good, bad, good, bad]));
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.diagnostic).toEqual({ stage: "claims", rule: "enum", field: "sensitivity", shape: "string", claim_index: 1, claim_count: 4 });
   });
 
   test("an empty claims list is valid", () => {
