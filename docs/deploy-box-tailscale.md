@@ -103,9 +103,9 @@ Finish line, `deploy/proof/container.sh` (CI-runnable, Linux only):
 | 1.3 | Loop is PID 1 and alive. | `docker exec` `kizuki serve status --json` reports `pid` 1, `/proc/1` exists, and `doctor.ok` is true. The CLI's status JSON carries `pid`, `supervisor` and `doctor`; the `running`/`lease` fields belong to core's `serveStatus()`, which no CLI verb calls. |
 | 1.4 | Health endpoint answers on loopback. | `curl -fsS 127.0.0.1:$PORT/health` inside the container → body `"ok":true`. |
 | 1.5 | Nothing listens off loopback. | `ss` is absent from the image, so the check reads `/proc/net/tcp` and `/proc/net/tcp6`: every row in state `0A` must have a loopback local address. |
-| 1.6 | Ingest works and fails closed. | `kizuki import markdown-folder --source /fixtures` exits 0 with stdout containing `events_stored=3` and `errors=0`; `kizuki query acme --scope ledger` exits 0, prints nothing on stdout, and its stderr contains `withheld=`; a second identical import exits 0 with stdout containing `events_stored=0` and `duplicates=3`. |
+| 1.6 | Ingest requires consent, then works, and stays queryable. | `kizuki import markdown-folder --source /fixtures` with no grant exits non-zero and its stderr contains `consent-required` (the negative case: a regression that silently removed the consent gate turns this into a success and fails the check); granting consent through the public path (`kizuki import ... --policy FILE --expected-revision 0 --operation-id ID`) makes the same import exit 0 with stdout containing `events_stored=3` and `errors=0`; `kizuki query acme --scope ledger` then exits 0 with `acme` in its own stdout and no `withheld=` in stderr; a second identical import (already granted) exits 0 with stdout containing `events_stored=0` and `duplicates=0`. |
 | 1.7 | Doctor is honest. | `kizuki doctor` output contains `supervisor: none` and `canon writing: off`, and no rail line contains `status=failed` or `status=down`. `RailDoctor.status` is `ok`, `down` or `idle`, so the literal `failed` this plan first named can never appear; `down` is the real unhealthy value and is checked too. |
-| 1.8 | State survives restart. | `docker restart` changes `State.StartedAt`; 1.3 passes again; a third identical import exits 0 with stdout containing `events_stored=0` and `duplicates=3`; `kizuki doctor` output contains `events=3`. A container renumbers its init process to 1 on every start, so a changed `StartedAt` is the restart evidence rather than a new pid. |
+| 1.8 | State survives restart. | `docker restart` changes `State.StartedAt`; 1.3 passes again; a third identical import (already granted) exits 0 with stdout containing `events_stored=0` and `duplicates=0`; `kizuki doctor` output contains `events=3`. A container renumbers its init process to 1 on every start, so a changed `StartedAt` is the restart evidence rather than a new pid. |
 | 1.9 | No plaintext secret in the image. | `docker history --no-trunc` and a filesystem grep for the value of `KIZUKI_MODEL_KEY` find nothing; `/vault/.kizuki/serve.token` mode is `600`. |
 | 1.10 | Root filesystem is read-only. | `docker inspect` shows `ReadonlyRootfs: true`; `touch /usr/bin/x` inside fails. |
 | 1.11 | Export is a readable exit. | `kizuki export --out /vault/export` exits 0, `/vault/export/ledger/events.jsonl` exists, and it contains the string `acme`. |
@@ -128,6 +128,56 @@ notes are real, queryable-by-nothing evidence in the ledger, and a `query`
 hit becomes observable only once M4 wires a model and a receipted write
 actually lands (see M4 check 4.3). This is a candidate issue for a future
 lane, not something this milestone fixes.
+
+Finding (2026-09-06, issue #1): upstream landed a source-consent model
+(`packages/core/src/ledger/source-grants.ts`) after this deploy tree was
+written, and it changed the 2026-09-03 finding above in a way worth
+recording precisely. Every freshly enrolled connection now gets
+`consent_required=1` (`packages/core/src/ledger/connections.ts`
+`registerConnection`), so `kizuki import markdown-folder --source
+/fixtures` with no grant is refused before any event reaches the ledger
+(`source_capture_denied`, with a `consent-required` hint naming the exact
+`kizuki connect grant` or `kizuki import ... --policy` invocation that
+grants it) — a stronger, ingest-time guarantee than the query-time
+"unlabeled, so withheld" behavior row 1.6 originally asserted. That older
+assertion is no longer reachable for a fresh vault at all: it depended on
+an *ungranted* import still succeeding, which the consent gate now refuses
+outright. Separately, granting consent through the documented public path
+also changes what happens to the data once ingest does succeed: a grant's
+policy carries a `sensitivity_floor`, and `authorizeSourceCapture` raises
+every captured event's sensitivity to at least `private`
+(`event.sensitivity_hint ?? "private"`, then raised further by the floor),
+so a consented import is never `unlabeled` and is served to the owner's
+own `query` rather than withheld (confirmed empirically, not assumed —
+`packages/cli/test/query.test.ts:105` asserts `ledger.stderr` does NOT
+contain `withheld=` after the identical grant `deploy/proof/container.sh`
+now performs). `deploy/proof/container.sh` check 1.6 was rewritten to
+match: it proves the ingest-time refusal as the negative case, then grants
+consent through `kizuki import`'s own `--policy
+--expected-revision --operation-id` options (the same options `kizuki
+connect grant` exposes) and proves the granted import both succeeds and is
+visible at `query`.
+
+First-run consent on a hosted box: connecting a real source has always
+been the owner's own step, not a provisioning one — `deploy/box/
+bootstrap.sh` (M3) provisions the box and starts the compose stack, and
+`container.sh`'s own check 1.6 above is the only place in this tree that
+runs `kizuki import` at all; `bootstrap.sh` never runs `kizuki connect` or
+`kizuki import` for any source. The consent model does not change that
+scope, and `bootstrap.sh` does not need to change for this finding, because
+a box that granted consent on the owner's behalf without the owner ever
+seeing the policy would defeat the point of asking.
+What changes is the shape of the owner's own next step once the box is up:
+they run `kizuki connect <connector> --source ...` (or, for a one-shot
+file import, `kizuki import <connector> --source PATH`) over the tailnet,
+see the `source_capture_denied; consent-required: ...` refusal naming the
+exact source key and revision, write a policy file naming the purposes,
+fields, retention and sensitivity floor they intend, and grant it with
+`kizuki connect grant --source KEY --policy FILE --expected-revision N
+--operation-id ID` (or pass those same three flags directly to the first
+`kizuki import`). This is an interactive, one-time act per source, not a
+provisioning step; automating it would mean the box guessing the owner's
+intended policy, which is exactly the thing consent exists to prevent.
 
 ### M2 Tailnet access
 

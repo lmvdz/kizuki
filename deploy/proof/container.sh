@@ -160,24 +160,71 @@ check_1_5() {
 }
 
 check_1_6() {
-  # Finding (2026-09-03, docs/deploy-box-tailscale.md "M1 Container floor"):
-  # a ledger event is only ever labeled from the connector's
-  # `sensitivity_hint` (packages/core/src/search/indexer.ts eventDocument);
-  # markdown-folder emits none, so every imported note is unlabeled and
-  # `query` withholds it fail-closed. This is the real floor behavior, not
-  # a bug this lane papers over, and this check asserts it rather than a
-  # search hit that would require writing canon outside the receipted
-  # writer.
+  # Finding (2026-09-06, issue #1): the 2026-09-03 comment this check
+  # carried assumed granting consent left a captured event unlabeled. That
+  # premise does not hold for a fresh vault under the current source-consent
+  # model (packages/core/src/ledger/source-grants.ts):
+  #   - every freshly enrolled connection gets consent_required=1
+  #     (packages/core/src/ledger/connections.ts registerConnection,
+  #     packages/core/src/ledger/connection-state-rows.ts
+  #     commitConnectionRow), so an ungranted import is refused at ingest
+  #     -- fail-closed before any event reaches the ledger, not a query-time
+  #     withholding of an unlabeled one. The negative case right below
+  #     proves this on the exact fixture source, before it is granted.
+  #   - a granted capture's sensitivity is raised to at least "private"
+  #     by the grant itself (authorizeSourceCapture:
+  #     `event.sensitivity_hint ?? "private"`, raised by the policy's
+  #     `sensitivity_floor`), so a consented import is never "unlabeled";
+  #     it is served to the owner's own query. This is proven, not assumed:
+  #     packages/cli/test/query.test.ts:105 asserts `ledger.stderr` does
+  #     NOT contain "withheld=" after the identical fixtureConsent grant
+  #     this check now performs through the CLI's public consent path.
+  # What this check proves instead: (1) an ungranted import is refused
+  # fail-closed with the documented consent-required hint -- a regression
+  # that silently removed the consent gate would turn this refusal into a
+  # success and fail the check; (2) granting consent through the public
+  # path (`kizuki import ... --policy --expected-revision --operation-id`,
+  # packages/cli/src/commands/import.ts) makes the same import succeed and
+  # its own content visible to the owner's own query.
+  local refuse1_err_file refuse1_out refuse1_err rc1
+  refuse1_err_file="$(mktemp)"
+  set +e
+  refuse1_out="$(docker exec "$CONTAINER" kizuki import markdown-folder --source /fixtures --vault /vault 2>"$refuse1_err_file")"
+  rc1=$?
+  set -e
+  refuse1_err="$(cat "$refuse1_err_file")"
+  rm -f "$refuse1_err_file"
+  [ "$rc1" -ne 0 ] || fail 1.6 ingest-works-fail-closed "import with no grant unexpectedly succeeded: $refuse1_out"
+  case "$refuse1_err" in
+    *consent-required*) ;;
+    *) fail 1.6 ingest-works-fail-closed "refusal missing 'consent-required' hint: $refuse1_err" ;;
+  esac
+
+  # Grant consent through the documented public path. --expected-revision 0
+  # is the revision the refusal above already names (grant?.revision ?? 0,
+  # packages/cli/src/source-consent.ts consentHint); --operation-id is an
+  # idempotency key for the grant write (packages/core/src/ledger/
+  # source-grants.ts setSourceGrant replays on a repeated id). The policy
+  # file's custody must satisfy packages/cli/src/source-consent.ts
+  # readSourcePolicy: owner-owned, no group/other write, no symlink; /tmp is
+  # this read-only-rootfs container's only writable path (see check 1.10),
+  # and its tmpfs mount is root-owned with the sticky bit set, which that
+  # custody check treats as trusted.
+  docker exec -i "$CONTAINER" sh -c 'umask 077 && cat > /tmp/fixtures-policy.json' <<'POLICY'
+{"purposes":["capture","recall","session","correction","audit","derive","extract","export"],"allowed_fields":["text","subjects","attachments","metadata"],"retention":"persistent_owned_until_revoked","egress":"local_only","sensitivity_floor":"private"}
+POLICY
+
   local out1
-  out1="$(docker exec "$CONTAINER" kizuki import markdown-folder --source /fixtures --vault /vault)" \
-    || fail 1.6 ingest-works-fail-closed "first import exited non-zero"
+  out1="$(docker exec "$CONTAINER" kizuki import markdown-folder --source /fixtures --vault /vault \
+    --policy /tmp/fixtures-policy.json --expected-revision 0 --operation-id proof-grant-fixtures)" \
+    || fail 1.6 ingest-works-fail-closed "granted import exited non-zero"
   case "$out1" in
     *events_stored=3*) ;;
-    *) fail 1.6 ingest-works-fail-closed "first import stdout missing events_stored=3: $out1" ;;
+    *) fail 1.6 ingest-works-fail-closed "granted import stdout missing events_stored=3: $out1" ;;
   esac
   case "$out1" in
     *errors=0*) ;;
-    *) fail 1.6 ingest-works-fail-closed "first import stdout missing errors=0: $out1" ;;
+    *) fail 1.6 ingest-works-fail-closed "granted import stdout missing errors=0: $out1" ;;
   esac
 
   local q_out q_err q_err_file
@@ -185,10 +232,12 @@ check_1_6() {
   q_out="$(docker exec "$CONTAINER" kizuki query acme --scope ledger --vault /vault 2>"$q_err_file")"
   q_err="$(cat "$q_err_file")"
   rm -f "$q_err_file"
-  [ -z "$q_out" ] || fail 1.6 ingest-works-fail-closed "query printed stdout when it should be silent: $q_out"
+  case "$q_out" in
+    *acme*) ;;
+    *) fail 1.6 ingest-works-fail-closed "granted import's own content did not surface at query: $q_out" ;;
+  esac
   case "$q_err" in
-    *withheld=*) ;;
-    *) fail 1.6 ingest-works-fail-closed "query stderr missing 'withheld=': $q_err" ;;
+    *withheld=*) fail 1.6 ingest-works-fail-closed "consented import was withheld: $q_err" ;;
   esac
 
   # Finding (2026-09-04, merging main's "Harden snapshot importers and the
