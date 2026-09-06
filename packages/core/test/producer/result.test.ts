@@ -51,6 +51,23 @@ describe("complete producer result boundary", () => {
     }
   });
 
+  test("claim_invalid dropped entries carry a revalidated diagnostic and reject malformed shapes", () => {
+    const diagnostic = { stage: "claims" as const, rule: "enum" as const, field: "sensitivity" as const, shape: "string" as const, claim_index: 1, claim_count: 3 };
+    const raw = { status: "ok" as const, claims: [draft()], usage, dropped: [{ reason: "claim_invalid" as const, diagnostic }] };
+    expect(validateProduceResult(raw)).toEqual({ result: raw, usage_known: true });
+
+    for (const badDropped of [
+      [{ reason: "claim_invalid" }],
+      [{ reason: "claim_invalid", diagnostic: { ...diagnostic, rule: CANARY } }],
+      [{ reason: "claim_invalid", diagnostic: { ...diagnostic, stage: "response" } }],
+      [{ reason: "claim_invalid", diagnostic, extra: CANARY }],
+    ]) {
+      const validated = validateProduceResult({ status: "ok", claims: [], usage, dropped: badDropped });
+      expect(validated.usage_known).toBe(false);
+      expect(JSON.stringify(validated)).not.toContain(CANARY);
+    }
+  });
+
   test("malformed nested values, accessors and excessive lists fail without executing getters", () => {
     let read = false;
     const accessor = { get status() { read = true; throw new Error(CANARY); }, usage };
