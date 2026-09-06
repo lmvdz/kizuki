@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -195,6 +196,174 @@ describe("serve doctor", () => {
     expect(report.calibration.write_rate).toBeCloseTo(0.4);
     expect(report.calibration.dedup_rate).toBeCloseTo(0.3);
     expect(report.calibration.failures).toEqual([]);
+    db.close();
+  });
+
+  // #473: a fresh vault has nothing to dedup against and every single-source
+  // claim sits at SINGLE_SOURCE_CAP by construction. Both calibration checks
+  // must recognize that as immaturity, not miscalibration, while still
+  // catching a model that is actually broken once the vault has seen a
+  // repeated fact.
+  describe("#473 calibration maturity", () => {
+    function insertClaim(
+      db: ReturnType<typeof vault>["db"],
+      opts: {
+        claim_id: string;
+        claim_key: string;
+        confidence: number;
+        corroboration: number;
+        asserted_at: string;
+      },
+    ) {
+      db.query(
+        `INSERT INTO claims
+           (claim_id, kind, target, body, frontmatter, provenance, subjects,
+            producer, confidence, status, created_at, body_hash,
+            subject, predicate, object, polarity, claim_key, authority,
+            sensitivity, taint, model_ref, valid_from, valid_to, asserted_at,
+            retracted_at, superseded_by, receipt_id, corroboration, last_confirmed_at)
+         VALUES (?, 'fact', NULL, ?, '{}', '[]', '[]', 'model', ?, 'live', ?, ?,
+                 ?, 'predicate', 'object', 'positive', ?, 'model_inference',
+                 NULL, 'quoted', NULL, '', NULL, ?, NULL, NULL, NULL, ?, NULL)`,
+      ).run(
+        opts.claim_id,
+        `body ${opts.claim_id}`,
+        opts.confidence,
+        opts.asserted_at,
+        `bh-${opts.claim_id}`,
+        opts.claim_key,
+        opts.claim_key,
+        opts.asserted_at,
+        opts.corroboration,
+      );
+    }
+
+    test("a healthy fresh vault — every claim single-source-capped, nothing to dedup against — reports ok", () => {
+      const { path, db } = vault();
+      writeServeIntent(path, "opted-out");
+      // 12 events in, 12 claims extracted, all 12 written (write_rate 1.0,
+      // dedup_rate 0): exactly the shape from the issue.
+      persistRunReceipt(
+        db,
+        path,
+        receipt("2026-09-01", {
+          run_id: "01JBFRESH00000000000000001",
+          claims_extracted: 12,
+          claims_written: 12,
+          claims_deduped: 0,
+        }),
+      );
+      for (let index = 1; index <= 12; index += 1) {
+        insertClaim(db, {
+          claim_id: `01JBFRESHCLAIM${String(index).padStart(4, "0")}`,
+          claim_key: `key-${index}`, // every claim about a distinct fact
+          confidence: 0.5, // SINGLE_SOURCE_CAP: forced, not chosen
+          corroboration: 1, // never re-observed: no dedup opportunity yet
+          asserted_at: "2026-09-01T00:00:01Z",
+        });
+      }
+      const report = inspectServeDoctor(db, path, { now: "2026-09-01T00:10:00Z" });
+      expect(report.calibration.write_rate).toBe(1);
+      expect(report.calibration.failures).toEqual([]);
+      expect(report.ok).toBe(true);
+      db.close();
+    });
+
+    test("write_rate still catches indiscriminate writing once dedup opportunity exists", () => {
+      const { path, db } = vault();
+      writeServeIntent(path, "opted-out");
+      persistRunReceipt(
+        db,
+        path,
+        receipt("2026-09-01", {
+          run_id: "01JBGREEDY0000000000000001",
+          claims_extracted: 20,
+          claims_written: 20, // write_rate 1.0: nothing ever absorbed
+          claims_deduped: 0,
+        }),
+      );
+      // Two claims share a claim_key: the same fact was extracted twice and
+      // the loop filed both instead of merging — a real dedup opportunity
+      // the model missed.
+      insertClaim(db, {
+        claim_id: "01JBGREEDYCLAIM0001",
+        claim_key: "repeated-key",
+        confidence: 0.5,
+        corroboration: 1,
+        asserted_at: "2026-09-01T00:00:01Z",
+      });
+      insertClaim(db, {
+        claim_id: "01JBGREEDYCLAIM0002",
+        claim_key: "repeated-key",
+        confidence: 0.5,
+        corroboration: 1,
+        asserted_at: "2026-09-01T00:00:02Z",
+      });
+      const report = inspectServeDoctor(db, path, { now: "2026-09-01T00:10:00Z" });
+      expect(report.calibration.write_rate).toBe(1);
+      expect(report.calibration.failures.some((item) => item.startsWith("write_rate"))).toBe(true);
+      expect(report.ok).toBe(false);
+      db.close();
+    });
+
+    test("confidence_not_produced still catches flat confidence among genuinely corroborated claims", () => {
+      const { path, db } = vault();
+      writeServeIntent(path, "opted-out");
+      // extracted 0 keeps write_rate out of this test entirely (extracted >
+      // 0 is required before that check runs at all).
+      persistRunReceipt(
+        db,
+        path,
+        receipt("2026-09-01", {
+          run_id: "01JBFLAT000000000000000001",
+          claims_extracted: 0,
+          claims_written: 0,
+          claims_deduped: 0,
+        }),
+      );
+      // 8 claims, each corroborated (re-observed) at least once, so none of
+      // them are sitting at the cap by construction — yet the model still
+      // stamps the same confidence on every one.
+      for (let index = 1; index <= 8; index += 1) {
+        insertClaim(db, {
+          claim_id: `01JBFLATCLAIM${String(index).padStart(4, "0")}`,
+          claim_key: `flat-key-${index}`,
+          confidence: 0.53,
+          corroboration: 2,
+          asserted_at: "2026-09-01T00:00:01Z",
+        });
+      }
+      const report = inspectServeDoctor(db, path, { now: "2026-09-01T00:10:00Z" });
+      expect(report.calibration.failures).toContain("confidence_not_produced");
+      expect(report.ok).toBe(false);
+      db.close();
+    });
+  });
+
+  // #473 part 2: doctor's own connection-state recovery sweep discarded its
+  // cause, so a genuine lock-contention race and real journal debris were
+  // both reported as the same bare string.
+  test("a connection-state recovery failure carries its cause instead of a bare string", () => {
+    const { path, db } = vault();
+    writeServeIntent(path, "opted-out");
+    // A writer in another process holds the ledger's write lock across its
+    // own swap, exactly as a concurrent doctor-sweep or a daemon still
+    // finishing its startup enrollment would. Doctor's own recover() then
+    // collides with it (SQLITE_BUSY) instead of finding real debris.
+    const other = new Database(join(path, ".kizuki", "kizuki.db"));
+    other.exec("BEGIN IMMEDIATE");
+    let report: ReturnType<typeof inspectServeDoctor>;
+    try {
+      report = inspectServeDoctor(db, path);
+    } finally {
+      other.exec("ROLLBACK");
+      other.close();
+    }
+    const failure = report.failures.find((item) => item.startsWith("connection state recovery failed"));
+    expect(failure).toBeDefined();
+    // Not just the bare string this used to be: the cause is now in it.
+    expect(failure).not.toBe("connection state recovery failed");
+    expect(failure).toContain("locked by another writer");
     db.close();
   });
 });

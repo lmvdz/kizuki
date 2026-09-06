@@ -1160,6 +1160,34 @@ of run receipts:
 Out-of-band values are `doctor` failures with the measured number, not
 warnings.
 
+**Implementation note (2026-09-06, issue #473).** Both checks assume the
+vault has had a chance to exercise dedup or corroboration. A fresh vault
+with one connector has neither: every claim_key is seen once, no claim is
+ever re-observed (`corroboration` stays at its default of 1), and every
+single-source claim sits at `SINGLE_SOURCE_CAP = 0.5` (§12.4) by
+construction. A healthy loop there writes everything (`write_rate = 1`)
+and produces zero confidence spread, and both were being reported as
+calibration failures on day one. Neither threshold moved — a wider band
+or a lower spread minimum detects less, and the estate failure these
+checks exist to catch (a 69.9% write rate) already sits inside the
+current band. Instead each check now requires a precondition proving the
+vault is mature enough to judge:
+
+- `write_rate` is judged only once some `claim_key` has been seen more
+  than once — either as more than one row sharing it (a repeat the loop
+  failed to merge) or as a single row with `corroboration > 1` (a repeat
+  it merged). Either is proof a dedup opportunity actually existed.
+- `confidence_spread` is computed only over claims with `corroboration >
+  1` — claims that left single-observation status and so were never
+  forced to the cap — and still requires at least 8 of them.
+
+A vault with no such history reports neither failure; a vault that has
+genuine repeats and still writes indiscriminately, or genuine
+corroboration and still stamps a flat confidence, still fails.
+`packages/core/src/serve/doctor.ts` and
+`packages/core/test/serve/doctor.test.ts` are the implementation and its
+regression tests.
+
 ---
 
 ## 5. Evidence authority and conflict

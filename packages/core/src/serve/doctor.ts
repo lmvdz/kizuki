@@ -137,14 +137,47 @@ function calibration(db: Database, receipts: RunReceipt[], now: string): Calibra
   const deduped = receipts.reduce((sum, receipt) => sum + receipt.claims_deduped, 0);
   const writeRate = written / Math.max(1, extracted);
   const dedupRate = deduped / Math.max(1, extracted);
-  if (extracted > 0 && (writeRate < CALIBRATION_BAND.min || writeRate > CALIBRATION_BAND.max)) {
+  // #473: write_rate assumes dedup/supersession has something to absorb. A
+  // vault where every claim_key has been seen exactly once, with no claim
+  // ever re-observed (corroboration stays at 1), has had no opportunity to
+  // dedup — a healthy loop there writes everything and scores 1.0 by
+  // construction. Judge the ratio only once the vault has actually seen a
+  // repeated fact, whether or not the loop merged it correctly: a claim_key
+  // with more than one row is a repeat the loop failed to merge, and a
+  // claim with corroboration > 1 is a repeat it merged successfully. Either
+  // is proof the ratio now means something.
+  const hasDedupOpportunity =
+    tableExists(db, "claims") &&
+    (db
+      .query<{ n: number }, []>(
+        `SELECT COUNT(*) AS n FROM (
+           SELECT claim_key FROM claims
+             WHERE claim_key IS NOT NULL
+             GROUP BY claim_key
+             HAVING COUNT(*) > 1 OR MAX(corroboration) > 1
+             LIMIT 1
+         )`,
+      )
+      .get()?.n ?? 0) > 0;
+  if (
+    extracted > 0 &&
+    hasDedupOpportunity &&
+    (writeRate < CALIBRATION_BAND.min || writeRate > CALIBRATION_BAND.max)
+  ) {
     failures.push(`write_rate ${writeRate.toFixed(3)} outside [${CALIBRATION_BAND.min}, ${CALIBRATION_BAND.max}]`);
   }
+  // #473: SINGLE_SOURCE_CAP (packages/core/src/claims/authority.ts) forces
+  // every single-observation claim to confidence 0.5. A fresh vault fed by
+  // one connector sits entirely at the cap, so the spread is zero by
+  // construction and measures the cap, not the model. Judge the spread only
+  // over claims that have been corroborated at least once (corroboration >
+  // 1) — claims that left single-observation status and so were free to
+  // carry a confidence the cap never touched.
   const confidences = tableExists(db, "claims")
     ? db
         .query<{ confidence: number }, []>(
           `SELECT confidence FROM claims
-            WHERE status IN ('live', 'superseded')
+            WHERE status IN ('live', 'superseded') AND corroboration > 1
             ORDER BY asserted_at DESC
             LIMIT 10000`,
         )
@@ -429,8 +462,13 @@ export function inspectServeDoctor(
     if (recovery.quarantined.length > 0) {
       failures.push(`connection state journals quarantined ${recovery.quarantined.length}`);
     }
-  } catch {
-    failures.push("connection state recovery failed");
+  } catch (error) {
+    // Preserve the cause: this can be genuine debris (a corrupt journal) or
+    // a transient lock a concurrent writer (daemon startup enrollment, a
+    // second doctor-sweep) held at the moment doctor ran. The two look
+    // identical as a bare string; the message tells them apart.
+    const detail = error instanceof Error ? error.message : String(error);
+    failures.push(`connection state recovery failed: ${detail}`);
   }
   for (const item of inspectConnections(db, { includeDisconnected: true })) {
     if (!item.ok) {
