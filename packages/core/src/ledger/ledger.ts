@@ -1,16 +1,19 @@
 import type { Database } from "bun:sqlite";
 import { authorizeSourceCapture, bindSourceEvent, type SourceAdmission } from "./source-grants";
-import { EVENT_SCHEMA, validateEventInput } from "../contracts/event";
-import { tableExists } from "./schema";
+import { validateEventInput } from "../contracts/event";
 import type {
-  AttachmentRef,
   CaptureEvent,
   CaptureEventInput,
-  SensitivityHint,
-  SubjectRef,
 } from "../contracts/event";
-import { computeContentHash } from "../util/hash";
+import { canonicalSerialize, computeContentHash, computeLegacyContentHash, sha256Hex } from "../util/hash";
+import { isRfc3339 } from "../util/time";
 import { isUlid, ulid } from "../util/ulid";
+import { EventRecordError, eventFromRow as fromRow, type EventRow } from "./event-record";
+import { EventOriginError, classifyNewEventOrigin } from "./event-origin";
+import { computeOriginBinding, nativeRequestDigest } from "./event-origin-binding";
+import { classifySqliteFailure, LedgerStoreError } from "./errors";
+import { LEDGER_ID_MAX, LEDGER_KIND_MAX, MAX_READ_SINCE, REPLAY_PAGE_SIZE } from "./limits";
+import { tableExists } from "./schema";
 
 export type AcceptErrorKind = "validation" | "infrastructure";
 
@@ -29,50 +32,23 @@ export interface LedgerCursor {
   event_id: string;
 }
 
+export interface LedgerPage {
+  events: CaptureEvent[];
+  /** Last committed token. Null only means beginning-of-stream. */
+  cursor: LedgerCursor | null;
+  exhausted: boolean;
+}
+
 export interface ReplayFilter {
   connector_id?: string;
   kind?: string;
   since?: string;
 }
 
-interface EventRow {
-  event_id: string;
-  connector_id: string;
-  source_record_id: string;
-  kind: string;
-  occurred_at: string;
-  observed_at: string;
-  text: string;
-  subjects: string;
-  sensitivity_hint: string | null;
-  deleted: number;
-  attachments: string;
-  metadata: string;
-  content_hash: string;
-  accepted_at: string;
-}
-
 interface ExistingEventRow {
   event_id: string;
   content_hash: string;
 }
-
-type EventInsertBindings = [
-  string,
-  string,
-  string,
-  string,
-  string,
-  string,
-  string,
-  string,
-  string | null,
-  number,
-  string,
-  string,
-  string,
-  string,
-];
 
 const EVENT_COLUMNS = `
   event_id,
@@ -88,32 +64,24 @@ const EVENT_COLUMNS = `
   attachments,
   metadata,
   content_hash,
-  accepted_at
+  accepted_at,
+  content_hash_version,
+  text_hash,
+  origin,
+  origin_binding_version,
+  origin_binding_kind,
+  origin_binding
 `;
 
-function fromRow(row: EventRow): CaptureEvent {
-  return {
-    schema: EVENT_SCHEMA,
-    event_id: row.event_id,
-    connector_id: row.connector_id,
-    source_record_id: row.source_record_id,
-    kind: row.kind,
-    occurred_at: row.occurred_at,
-    observed_at: row.observed_at,
-    text: row.text,
-    subjects: JSON.parse(row.subjects) as SubjectRef[],
-    ...(row.sensitivity_hint === null
-      ? {}
-      : { sensitivity_hint: row.sensitivity_hint as SensitivityHint }),
-    deleted: row.deleted === 1,
-    attachments: JSON.parse(row.attachments) as AttachmentRef[],
-    metadata: JSON.parse(row.metadata) as Record<string, unknown>,
-    content_hash: row.content_hash,
-  };
-}
-
-function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+function decodeStored(row: EventRow, db: Database): CaptureEvent {
+  try {
+    return fromRow(row, db);
+  } catch (error) {
+    if (error instanceof EventRecordError || error instanceof EventOriginError) {
+      throw new LedgerStoreError("corrupt", error.message, { cause: error });
+    }
+    throw error;
+  }
 }
 
 export function accept(
@@ -141,14 +109,14 @@ export function accept(
         kind: "validation",
       };
     }
-    const acceptedAt = new Date().toISOString();
 
     return db.transaction((): AcceptResult => {
       if (deps.source !== undefined) { normalized = authorizeSourceCapture(db, normalized, deps.source); contentHash = computeContentHash(normalized); }
-      const duplicate = db
-        .query<ExistingEventRow, [string, string, string]>(
+      const textHash = sha256Hex(normalized.text);
+      let duplicate = db
+        .query<EventRow, [string, string, string]>(
           `
-            SELECT event_id, content_hash
+            SELECT ${EVENT_COLUMNS}
             FROM events
             WHERE connector_id = ?
               AND source_record_id = ?
@@ -161,8 +129,17 @@ export function accept(
           normalized.source_record_id,
           contentHash,
         );
+      if (duplicate !== null && (duplicate.content_hash_version !== 2 ||
+          canonicalSerialize(fromRow(duplicate, db)) !== canonicalSerialize(normalized))) throw new EventRecordError();
+      if (duplicate === null) {
+        using statement = db.prepare<EventRow, [string, string, string]>(`SELECT ${EVENT_COLUMNS} FROM events
+          WHERE connector_id=? AND source_record_id=? AND content_hash=? AND content_hash_version=1 LIMIT 1`);
+        const legacy = statement.get(normalized.connector_id, normalized.source_record_id, computeLegacyContentHash(normalized));
+        if (legacy !== null && canonicalSerialize(fromRow(legacy, db)) === canonicalSerialize(normalized)) duplicate = legacy;
+      }
       if (duplicate !== null) {
         if (deps.source !== undefined) bindSourceEvent(db, duplicate.event_id, deps.source, true);
+        fromRow(duplicate, db);
         return { status: "duplicate" };
       }
 
@@ -183,41 +160,8 @@ export function accept(
         };
       }
 
-      db.query<never, EventInsertBindings>(
-        `
-          INSERT INTO events (
-            event_id,
-            connector_id,
-            source_record_id,
-            kind,
-            occurred_at,
-            observed_at,
-            text,
-            subjects,
-            sensitivity_hint,
-            deleted,
-            attachments,
-            metadata,
-            content_hash,
-            accepted_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `,
-      ).run(
-        eventId,
-        normalized.connector_id,
-        normalized.source_record_id,
-        normalized.kind,
-        normalized.occurred_at,
-        normalized.observed_at,
-        normalized.text,
-        JSON.stringify(normalized.subjects),
-        normalized.sensitivity_hint ?? null,
-        normalized.deleted ? 1 : 0,
-        JSON.stringify(normalized.attachments),
-        JSON.stringify(normalized.metadata),
-        contentHash,
-        acceptedAt,
-      );
+      const origin = classifyNewEventOrigin(db, { text: normalized.text, text_hash: textHash });
+      insertBoundEvent(db, normalized, eventId, origin, "capture", null);
 
       if (deps.source !== undefined) bindSourceEvent(db, eventId, deps.source);
       const stored = db
@@ -226,28 +170,102 @@ export function accept(
         )
         .get(eventId);
       if (stored === null) {
-        throw new Error(`stored event ${eventId} could not be read back`);
+        throw new LedgerStoreError("corrupt", "stored event could not be read back");
       }
-      return { status: "stored", event: fromRow(stored) };
+      return { status: "stored", event: decodeStored(stored, db) };
     }).immediate();
   } catch (error) {
+    const infra = classifySqliteFailure(error);
+    if (infra !== null) throw infra;
+    if (error instanceof LedgerStoreError) throw error;
+    if (error instanceof EventRecordError || error instanceof EventOriginError) {
+      return {
+        status: "error",
+        error: error.message,
+        kind: "infrastructure",
+      };
+    }
     return {
       status: "error",
-      error: errorText(error),
-      kind: isInfrastructureError(error) ? "infrastructure" : "validation",
+      error: error instanceof Error ? error.message : String(error),
+      kind: "validation",
     };
   }
 }
 
-function isInfrastructureError(error: unknown): boolean {
-  const code =
-    error instanceof Error && "code" in error && typeof error.code === "string"
-      ? error.code
-      : "";
-  const text = error instanceof Error ? error.message : String(error);
-  return /SQLITE_(BUSY|LOCKED|CORRUPT|IOERR|FULL|CANTOPEN|READONLY|NOTADB|CONSTRAINT_FOREIGNKEY)/.test(
-    `${code} ${text}`,
-  );
+/** Private insertion primitive: callers already own the write transaction. */
+function insertBoundEvent(db: Database, input: CaptureEventInput, eventId: string,
+  origin: CaptureEvent["origin"], kind: CaptureEvent["origin_binding_kind"], requestDigest: string | null,
+): void {
+  const acceptedAt = new Date().toISOString();
+  const identity = { event_id: eventId, content_hash_version: 2 as const,
+    content_hash: computeContentHash(input), text_hash: sha256Hex(input.text), origin };
+  using insert = db.prepare(`INSERT INTO events (${EVENT_COLUMNS}) VALUES (${Array(20).fill("?").join(",")})`);
+  insert.run(eventId, input.connector_id, input.source_record_id, input.kind, input.occurred_at, input.observed_at,
+    input.text, JSON.stringify(input.subjects), input.sensitivity_hint ?? null, input.deleted ? 1 : 0,
+    JSON.stringify(input.attachments), JSON.stringify(input.metadata), identity.content_hash, acceptedAt, 2,
+    identity.text_hash, origin, 1, kind, computeOriginBinding(identity, acceptedAt, kind, requestDigest));
+}
+
+/** Internal Core native operation. Public capture has no exemption parameter. */
+export function recordNativeCorrectionEvent(db: Database, input: CaptureEventInput, requestDigest: string): {
+  event_id: string; duplicate: boolean;
+} {
+  const checked = validateEventInput(input);
+  if (!checked.ok || checked.value.connector_id !== "kizuki.owner" || !/^[a-f0-9]{64}$/.test(requestDigest)) {
+    throw new Error("invalid native correction recording");
+  }
+  if (db.inTransaction) throw new Error("native correction recording requires a top-level transaction");
+  const event = checked.value;
+  return db.transaction(() => {
+    using existing = db.prepare<EventRow, [string, string]>(`SELECT * FROM events
+      WHERE connector_id=? AND source_record_id=? ORDER BY accepted_at,event_id LIMIT 1`);
+    const prior = existing.get(event.connector_id, event.source_record_id);
+    if (prior !== null) {
+      const stored = fromRow(prior, db);
+      if (nativeRequestDigest(db, stored.event_id) !== requestDigest) {
+        throw new Error("correction recording conflicts with existing evidence");
+      }
+      return { event_id: stored.event_id, duplicate: true };
+    }
+    const eventId = ulid();
+    insertBoundEvent(db, event, eventId, "external", "native", requestDigest);
+    using proof = db.prepare(`INSERT INTO native_owner_evidence
+      (event_id,origin,request_digest,recorded_at,filing_state,event_content_hash) VALUES (?,'correction',?,?,'recorded',?)`);
+    proof.run(eventId, requestDigest, event.observed_at, computeContentHash(event));
+    const stored = readEvent(db, eventId);
+    if (stored === null) throw new Error("native correction recording failed");
+    return { event_id: stored.event_id, duplicate: false };
+  }).immediate();
+}
+
+function assertReadLimit(limit: number): void {
+  if (!Number.isInteger(limit) || limit < 0) {
+    throw new LedgerStoreError("usage", "readSince limit must be a non-negative integer");
+  }
+  if (limit > MAX_READ_SINCE) {
+    throw new LedgerStoreError(
+      "usage",
+      `readSince limit must be at most ${MAX_READ_SINCE}`,
+    );
+  }
+}
+
+function pageFromRows(
+  rows: EventRow[],
+  limit: number,
+  previous: LedgerCursor | null,
+  db: Database,
+): LedgerPage {
+  const last = rows.at(-1);
+  return {
+    events: rows.map((row) => decodeStored(row, db)),
+    cursor:
+      last === undefined
+        ? previous
+        : { accepted_at: last.accepted_at, event_id: last.event_id },
+    exhausted: rows.length < limit,
+  };
 }
 
 /** Internal authoritative lookup used by bounded deferred extraction replay. */
@@ -255,18 +273,18 @@ export function readEvent(db: Database, eventId: string): CaptureEvent | null {
   const row = db.query<EventRow, [string]>(
     `SELECT ${EVENT_COLUMNS} FROM events WHERE event_id = ?`,
   ).get(eventId);
-  return row === null ? null : fromRow(row);
+  return row === null ? null : decodeStored(row, db);
 }
 
 export function readSince(
   db: Database,
   cursor: LedgerCursor | null,
   limit: number,
-): { events: CaptureEvent[]; cursor: LedgerCursor | null } {
-  if (!Number.isInteger(limit) || limit < 0) {
-    throw new RangeError("readSince limit must be a non-negative integer");
+): LedgerPage {
+  assertReadLimit(limit);
+  if (limit === 0) {
+    return { events: [], cursor, exhausted: true };
   }
-  if (limit === 0) return { events: [], cursor: null };
 
   const rows =
     cursor === null
@@ -293,17 +311,41 @@ export function readSince(
           )
           .all(cursor.accepted_at, cursor.accepted_at, cursor.event_id, limit);
 
-  const last = rows.at(-1);
-  return {
-    events: rows.map(fromRow),
-    cursor:
-      last === undefined
-        ? null
-        : { accepted_at: last.accepted_at, event_id: last.event_id },
-  };
+  return pageFromRows(rows, limit, cursor, db);
 }
 
-const REPLAY_PAGE = 500;
+function assertIdentifier(value: string, label: string, max: number): string {
+  if (value.length === 0 || value.length > max) {
+    throw new LedgerStoreError("usage", `${label} length must be 1..${max}`);
+  }
+  if ([...value].some((ch) => ch.charCodeAt(0) < 32)) {
+    throw new LedgerStoreError("usage", `${label} contains a control character`);
+  }
+  return value;
+}
+
+export function normalizeReplayFilter(filter: ReplayFilter): ReplayFilter {
+  const out: ReplayFilter = {};
+  if (filter.connector_id !== undefined) {
+    if (typeof filter.connector_id !== "string") {
+      throw new LedgerStoreError("usage", "connector_id must be a string");
+    }
+    out.connector_id = assertIdentifier(filter.connector_id, "connector_id", LEDGER_ID_MAX);
+  }
+  if (filter.kind !== undefined) {
+    if (typeof filter.kind !== "string") {
+      throw new LedgerStoreError("usage", "kind must be a string");
+    }
+    out.kind = assertIdentifier(filter.kind, "kind", LEDGER_KIND_MAX);
+  }
+  if (filter.since !== undefined) {
+    if (!isRfc3339(filter.since)) {
+      throw new LedgerStoreError("usage", "since must be an RFC3339 timestamp");
+    }
+    out.since = filter.since;
+  }
+  return out;
+}
 
 const LIVE_PREDICATE = `
   events.deleted = 0
@@ -322,15 +364,13 @@ const LIVE_PREDICATE = `
   )
 `;
 
-function replayPage(
-  db: Database,
+function replayWhere(
   filter: ReplayFilter,
   cursor: LedgerCursor | null,
   liveOnly: boolean,
-): { events: CaptureEvent[]; cursor: LedgerCursor | null } {
+): { sql: string; bindings: Array<string | number> } {
   const conditions: string[] = [];
-  const bindings: (string | number)[] = [];
-
+  const bindings: Array<string | number> = [];
   if (filter.connector_id !== undefined) {
     conditions.push("events.connector_id = ?");
     bindings.push(filter.connector_id);
@@ -350,28 +390,9 @@ function replayPage(
     );
     bindings.push(cursor.accepted_at, cursor.accepted_at, cursor.event_id);
   }
-
-  const where =
-    conditions.length === 0 ? "" : `WHERE ${conditions.join(" AND ")}`;
-  bindings.push(REPLAY_PAGE);
-  const rows = db
-    .query<EventRow, (string | number)[]>(
-      `
-        SELECT ${EVENT_COLUMNS}
-        FROM events
-        ${where}
-        ORDER BY events.accepted_at, events.event_id
-        LIMIT ?
-      `,
-    )
-    .all(...bindings);
-  const last = rows.at(-1);
   return {
-    events: rows.map(fromRow),
-    cursor:
-      last === undefined
-        ? null
-        : { accepted_at: last.accepted_at, event_id: last.event_id },
+    sql: conditions.length === 0 ? "" : `WHERE ${conditions.join(" AND ")}`,
+    bindings,
   };
 }
 
@@ -380,13 +401,25 @@ function* replayPages(
   filter: ReplayFilter,
   liveOnly: boolean,
 ): IterableIterator<CaptureEvent> {
+  const normalized = normalizeReplayFilter(filter);
   let cursor: LedgerCursor | null = null;
   for (;;) {
-    const page = replayPage(db, filter, cursor, liveOnly);
-    if (page.events.length === 0) return;
-    for (const event of page.events) yield event;
-    if (page.cursor === null || page.events.length < REPLAY_PAGE) return;
-    cursor = page.cursor;
+    const where = replayWhere(normalized, cursor, liveOnly);
+    const rows = db
+      .query<EventRow, Array<string | number>>(
+        `
+          SELECT ${EVENT_COLUMNS}
+          FROM events
+          ${where.sql}
+          ORDER BY events.accepted_at, events.event_id
+          LIMIT ?
+        `,
+      )
+      .all(...where.bindings, REPLAY_PAGE_SIZE);
+    for (const row of rows) yield decodeStored(row, db);
+    const last = rows.at(-1);
+    if (last === undefined || rows.length < REPLAY_PAGE_SIZE) return;
+    cursor = { accepted_at: last.accepted_at, event_id: last.event_id };
   }
 }
 

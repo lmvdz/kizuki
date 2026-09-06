@@ -107,7 +107,7 @@ Unknown frontmatter keys must use the \`x-*\` extension namespace.
 
 const SCHEMA_DOCTRINE_V1_REVIEWED_MISSING = `# Page schema
 
-Every page requires \`id\`, \`title\`, \`type\`, \`status\`, and \`sensitivity\` frontmatter.
+Every page requires \`id\`, \`title\`, \`type\`, \`status\`, \`sensitivity\`, and \`taint\` frontmatter.
 Canon is reviewed Markdown; staging belongs in the database.
 Every page carries \`sensitivity\` and \`taint\`; a page missing
 either is never served to anyone, including you.
@@ -229,6 +229,17 @@ export interface InitVaultResult {
 
 function journalPath(root: string): string {
   return join(root, ".kizuki", JOURNAL_NAME);
+}
+
+/** Refuse before writes: native Windows cannot enforce our POSIX custody floor. */
+function assertPermissionPlatform(): void {
+  if (process.platform === "win32") {
+    throw new VaultInitError(
+      "insecure_permissions",
+      "Native Windows (win32) is unsupported: Kizuki requires owner-only POSIX permissions. " +
+        "Use Linux or macOS, or WSL with the vault on its Linux filesystem.",
+    );
+  }
 }
 
 function processUid(): number | null {
@@ -513,6 +524,7 @@ function reportControlFile(reports: ControlPathReport[], root: string, rel: stri
 }
 
 export function inspectVaultControl(root: string): ControlPathReport[] {
+  assertPermissionPlatform();
   const reports: ControlPathReport[] = [];
   hardenLedgerFile(join(root, ".kizuki", "kizuki.db"));
   reportControlDir(reports, root, ".kizuki", true);
@@ -600,6 +612,7 @@ function hardenControlTree(root: string, repaired: string[]): void {
 }
 
 export function hardenLedgerFile(dbPath: string): void {
+  assertPermissionPlatform();
   if (!existsSync(dbPath)) return;
   chmodPrivateFile(dbPath);
   for (const suffix of ["-wal", "-shm"] as const) {
@@ -609,6 +622,7 @@ export function hardenLedgerFile(dbPath: string): void {
 }
 
 export function assertVaultControl(root: string): void {
+  assertPermissionPlatform();
   const control = join(root, ".kizuki");
   const st = lstatOrNull(control);
   if (st === null) {
@@ -682,6 +696,7 @@ function classifyTarget(
 }
 
 export function initVault(path: string, options: InitVaultOptions = {}): InitVaultResult {
+  assertPermissionPlatform();
   const created: string[] = [];
   const repaired: string[] = [];
   const upgraded: string[] = [];

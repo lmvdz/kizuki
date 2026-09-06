@@ -23,7 +23,7 @@ mkdir -p "$fixture_root/docs" "$fixture_root/packages"
 exact_name='G''Brain'
 name_re='g''brain'
 canonical_url='https://github.com/garrytan/g''brain'
-printf '# Credits\n\n%s\n' "$exact_name" >"$fixture_root/README.md"
+printf '# Credits\n\n[%s](%s)\n' "$exact_name" "$canonical_url" >"$fixture_root/README.md"
 printf '# Upstream policy\n\n[%s](%s)\n' "$exact_name" "$canonical_url" >"$fixture_root/docs/upstream-policy.md"
 git -C "$fixture_root" add README.md docs/upstream-policy.md
 
@@ -199,7 +199,7 @@ if assert_safe_reachable_commit_messages "$history_messages" >/dev/null 2>&1; th
   exit 1
 fi
 
-remaining_tokens=('her''mes' 'ika-''hetzner' 'alb''edo' 'g''brain')
+remaining_tokens=('her''mes' 'ika-''hetzner' 'g''brain')
 for remaining in "${remaining_tokens[@]}"; do
   printf 'review notes mention %s\n' "$remaining" >"$history_messages"
   if assert_safe_reachable_commit_messages "$history_messages" >/dev/null 2>&1; then
@@ -207,6 +207,19 @@ for remaining in "${remaining_tokens[@]}"; do
     exit 1
   fi
 done
+
+# Trailer lines are ignored by denylist-history.
+# Floor-guardian display names are tracked-text only (not history).
+printf 'Harden doctor\n\nCo-authored-by: Alb''edo <nazarick@agentmail.to>\n' >"$history_messages"
+assert_safe_reachable_commit_messages "$history_messages"
+printf 'Harden doctor\n\nmentions alb''edo in the body\n\nCo-authored-by: bot <bot@example.invalid>\n' >"$history_messages"
+assert_safe_reachable_commit_messages "$history_messages"
+printf 'Harden doctor\n\nmentions her''mes in the body\n\nCo-authored-by: bot <bot@example.invalid>\n' >"$history_messages"
+if assert_safe_reachable_commit_messages "$history_messages" >/dev/null 2>&1; then
+  printf 'policy test failed: body denylist token passed when trailer present\n' >&2
+  exit 1
+fi
+
 rm -f -- "$history_messages"
 
 printf 'verification policy tests passed\n'

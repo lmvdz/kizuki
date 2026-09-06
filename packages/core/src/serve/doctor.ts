@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { join } from "node:path";
+import { inspectPageIndex } from "../canon";
 import { isMachineOriginPath } from "../canon/origin";
 import { formatProducerDiagnostic } from "../producer/diagnostics";
 import { pendingRetrievalOps } from "../claims/store";
@@ -327,6 +328,7 @@ function storeDoctor(
     degraded.push("retrieval-ops-stale");
   }
   if (!purge.ok) degraded.push("purge-unhealthy");
+  degraded.push("identity-authority-unavailable");
   const search = readDerivedMeta(db, "search");
   const graph = readDerivedMeta(db, "graph");
   return {
@@ -443,6 +445,7 @@ export function inspectServeDoctor(
   if (stores.degraded.includes("retrieval-ops-stale")) {
     failures.push("retrieval_ops older than SLA");
   }
+  failures.push(...inspectPageIndex(db));
 
   return {
     supervisor,

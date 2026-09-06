@@ -14,7 +14,7 @@ SQLite-only rule for derived retrieval.
 
 | Requirement | Notes |
 | --- | --- |
-| [Bun](https://bun.sh) **1.3.10** | The version CI pins in `.github/workflows/ci.yml` |
+| [Bun](https://bun.sh) **1.3.14** | The version CI pins in `.github/workflows/ci.yml` |
 | Git | Full history; `bun run verify` refuses a shallow clone |
 
 There is no packaged installer and no `npm i -g kizuki`. Work from a clone.
@@ -58,6 +58,16 @@ fails the gate on forbidden identifiers in tracked text and reachable commit
 messages.
 
 ## Tests
+
+**WSL:** use a clone on the distribution's Linux filesystem (for example,
+`~/src/kizuki`) for `bun test` and `bun run verify`. Full-suite verification
+from Windows-mounted paths such as `/mnt/c` or `/mnt/d` is unsupported:
+filesystem latency can exhaust tree-scan and subprocess test deadlines even
+when the same revision passes on the Linux filesystem. Focused checks on
+those mounts are useful, but a timeout needs reproduction on the Linux
+filesystem before it establishes a regression. Keep existing checkouts and
+uncommitted changes intact, test the intended revision, and record its exact
+commit and filesystem location. Keep the existing test deadlines.
 
 Prefer a failing public-seam test before the implementation change. Then:
 

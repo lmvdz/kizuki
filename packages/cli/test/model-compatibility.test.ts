@@ -1,7 +1,8 @@
 import { afterEach, expect, test } from "bun:test";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { listCanonReceipts, listClaims, listConnections, listRunReceipts, openLedger, setSourceGrant } from "@kizuki/core";
+import { listCanonReceipts, listClaims, listConnections, listRunReceipts, setSourceGrant } from "@kizuki/core";
+import { openLedger } from "@kizuki/core/testing";
 import { startFakeEndpoint } from "../../llm/test/fake-endpoint";
 import { createHelpers } from "./helpers";
 
@@ -32,7 +33,7 @@ test("native source consent, model canon, rejected responses and doctor compose"
     return Response.json({ id: "synthetic", model: MODEL, provider: CANARY,
       choices: [{ index: 0, finish_reason: "stop", native_finish_reason: "stop", logprobs: null,
         message: { role: "assistant", content: JSON.stringify({ claims: [mode === "claims" ? { ...claim, predicate: { [CANARY]: CANARY } } : claim] }), refusal: null,
-          reasoning: CANARY, ...(mode === "metadata" ? { [CANARY]: { data: CANARY } } : {}) } }],
+          reasoning: CANARY, name: CANARY, [CANARY]: { data: CANARY }, ...(mode === "metadata" ? { annotations: [{ text: CANARY }] } : {}) } }],
       usage: { prompt_tokens: 12, completion_tokens: 8 } });
   });
   const database = join(setup.vault, ".kizuki/kizuki.db");

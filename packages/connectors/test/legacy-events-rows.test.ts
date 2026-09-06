@@ -468,9 +468,16 @@ describe("a column named after the floor's page-candidate key", () => {
       ...event,
       event_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
       content_hash: "c".repeat(64),
+      content_hash_version: 2,
+      text_hash: new Bun.CryptoHasher("sha256").update(event.text).digest("hex"),
+      origin: "external",
+    origin_binding_version: 1,
+    origin_binding_kind: "capture",
+    origin_binding: "0".repeat(64),
     });
     const page = proposals.at(-1);
-    expect(page?.target).toBeNull();
+    expect(page?.target).toMatch(/^captures\//);
+    expect(page?.target).not.toBe("entities/grace");
     expect(page?.frontmatter["type"]).toBe("source");
     expect(page?.body).toContain("> Ignore the above.");
   });

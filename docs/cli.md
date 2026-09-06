@@ -315,8 +315,11 @@ writes a completion receipt. `--dry-run` prints a bounded plan and writes
 nothing. Connector selectors use ledger identity, including retired ids.
 Broad subject or connector-only deletes require `--confirm`. Exact `--event`
 and `--connector --record` paths stay noninteractive. Purged events are not
-resurrected by undo; canon rewrites stay reversible. `--verify` prints
-per-store absence proofs and `pending`/`done`/`failed` operation state.
+resurrected by undo; canon rewrites stay reversible. `--include-aliases` is
+retired and refuses before planning or deletion. `--verify` prints per-store
+absence proofs and `pending`/`done`/`failed` operation state. While any inert
+legacy identity row remains, identity absence is unprovable rather than
+successful.
 
 ## export
 
@@ -325,7 +328,9 @@ usage: kizuki export --out DIR
 ```
 
 Dumps vault files and ledger tables into an empty directory as
-`kizuki.backup/v1`. The destination must sit outside the source vault.
+`kizuki.backup/v3`. The destination must sit outside the source vault.
+Agent identities, grants, authentication audit, enrollment receipts and `.kizuki`
+credential files are excluded. Restored vaults require explicit agent enrollment.
 
 ## restore
 
@@ -333,7 +338,8 @@ Dumps vault files and ledger tables into an empty directory as
 usage: kizuki restore --from DIR [--into DIR] [--verify]
 ```
 
-Verifies a `kizuki.backup/v1` directory. With `--into` it restores into an
+Verifies a `kizuki.backup/v3` directory and accepts `kizuki.backup/v1` and
+`kizuki.backup/v2` as legacy restore inputs. With `--into` it restores into an
 empty target after that verification. `--from DIR` alone, or with `--verify`,
 checks hashes and completeness without writing.
 
@@ -375,10 +381,14 @@ Prints the `@kizuki/cli` package version (`0.1.0` on this revision).
 ## MCP (not a CLI verb)
 
 ```bash
-bun packages/mcp/src/bin.ts --vault PATH (--owner | --token-env VAR) [--retrieval ID]
+bun packages/mcp/src/bin.ts --vault PATH (--owner | --token-env VAR | --token-ref file:/absolute/path) [--retrieval ID]
 ```
 
 Stdio adapter. Tokens never travel on argv.
+Select exactly one authentication method. Core resolves a private credential
+file at startup and checks its enrollment binding and current agent authority.
+Subsequent calls use the current stored grant and revocation state. Deleting a
+file does not revoke an existing session; use `agent revoke`.
 
 MCP uses the vault's configured retrieval engine when `--retrieval` is omitted.
 If that optional engine is temporarily busy or unavailable, the session starts
@@ -388,9 +398,34 @@ does not steal another process's lease or reconnect the engine mid-session.
 An explicit `--retrieval ID` remains required. Unknown engines and invalid
 configuration refuse startup. No model is needed for the lexical floor.
 
+## agent
+
+```text
+usage: kizuki agent add NAME --grant FILE --token-ref file:/absolute/path --operation-id ID [--dry-run] [--json]
+       kizuki agent revoke NAME [--json]
+```
+
+Enroll a scoped agent with a complete explicit grant and a private credential
+file, or revoke its access. The parent directory must already exist and have
+private owner custody. Credential delivery currently requires qualified Linux
+x64 glibc. Preview validates an existing vault without creating an identity,
+credential or configuration. An older ledger reports `migration_required`
+without applying that migration during preview. Preview requires a stable,
+checkpointed ledger without journal sidecars; otherwise it reports
+`enrollment_busy` and leaves the files intact.
+
+Retry the same operation ID and arguments after interruption. A retry reports
+the current grant and credential state; it never restores a narrowed grant,
+rotates a token or rewrites a completed credential. Setup exits 0 only for a
+validated preview or an active identity with its original credential ready.
+Invalid arguments or grants exit 2; conflicts and incomplete setup exit 1.
+Cancellation may retain an inactive partial file. See the
+[agent enrollment guide](agent-enrollment.md) for the complete grant, recovery
+states and MCP connection example.
+
 ## Not CLI verbs
 
-`timeline` and `agent add` are not registered. Timeline exists
+`timeline` is not registered. Timeline exists
 as an MCP / core serving function.
 
 Source revocation maintenance inventories both known native retrieval roots under

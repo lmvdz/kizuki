@@ -4,10 +4,11 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
-  EXTRACTION_SYSTEM_PROMPT, addAgent,
-  initAgents, listCanonReceipts, listClaims, listConnections, openLedger, readSince, setSourceGrant,
+  EXTRACTION_SYSTEM_PROMPT, addAgent, authenticate, authorize, toolAllowed,
+  initAgents, listClaims, listConnections, readSince, receiptsForClaim, setSourceGrant,
 } from "../packages/core/src/index";
 import type { CaptureEvent, Claim, Envelope, RunReceipt, SearchHit } from "../packages/core/src/index";
+import { openLedger } from "../packages/core/src/ledger/db";
 import { verifyChecksumManifest } from "./release-artifacts";
 import { releaseTarget, requireNativeHost } from "./release-targets";
 import { parseBuildInfo } from "./stranger-proof";
@@ -318,7 +319,15 @@ export async function runNativeQuality(options: { artifact?: string } = {}) {
     const expectedCanon = item.expected.filter((claim) => claim.bodies.some((body) => body.toLowerCase().includes(item.retrieval_query.toLowerCase())));
     const token = withLedger(vault, (db) => {
       initAgents(db);
-      return addAgent(db, `quality-public-${commands.length}`, { ceiling: "public", tools: ["search", "context_packet"] }).token;
+      const created = addAgent(db, `quality-public-${commands.length}`, {
+        ceiling: "public", tools: ["search", "context_packet"], types: null, subjects: null,
+      });
+      const principal = authenticate(db, created.token);
+      assert(principal !== null && principal.kind === "agent", "quality public agent did not authenticate");
+      assert(toolAllowed(principal.grant, "search") && toolAllowed(principal.grant, "context_packet") &&
+        authorize(principal.grant, { id: "quality:public-control", sensitivity: "public", type: "fact", subjects: ["quality:probe"] }).allow,
+        "quality public agent has no record authority; disclosure result would be vacuous");
+      return created.token;
     });
     const [owner] = await mcp(vault, [{ name: "search", arguments: { query: item.retrieval_query, scope: "ledger" } }]);
     const [publicResult, publicPacket] = await mcp(vault, [
@@ -386,7 +395,7 @@ export async function runNativeQuality(options: { artifact?: string } = {}) {
         consumers: { before, after }, failures });
       if (item.id === "q01") {
         assert(claims.length === 1, "direct fixture did not file one model claim");
-        const initialReceipt = withLedger(fixture.vault, (db) => listCanonReceipts(db, { writer: "loop", limit: 8 })[0]);
+        const initialReceipt = withLedger(fixture.vault, (db) => receiptsForClaim(db, claims[0]!.claim_id)[0]);
         assert(initialReceipt !== undefined, "direct fixture has no canon write receipt");
         const page = join(fixture.vault, initialReceipt.page_path), initialBytes = sha256(readFileSync(page));
         // Remove the model before exercising the deterministic consumers.

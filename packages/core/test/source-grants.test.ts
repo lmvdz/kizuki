@@ -27,7 +27,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   accept,
-  openLedger,
   registerConnection,
   disconnect,
   initVault,
@@ -39,6 +38,7 @@ import {
   resumeSourceRevocation,
   sourcePolicyEpoch,
 } from "../src/index";
+import { openLedger } from "../src/ledger/db";
 import { validEvent } from "./fixtures";
 import { ulid } from "../src/util/ulid";
 const dirs: string[] = [];
@@ -351,6 +351,7 @@ test("native serving denies legacy agent access, honors purpose and invalidates 
     const principal = authenticate(
       db,
       addAgent(db, "synthetic-reader", {
+        types: null, subjects: null,
         ceiling: "private",
         tools: ["timeline", "context_packet"],
       }).token,
@@ -494,6 +495,54 @@ test("revocation stays denied while a derived write is in flight and removes its
     expect(db.query("SELECT state FROM retrieval_ops").get()).toEqual({
       state: "cancelled",
     });
+  } finally {
+    db.close();
+  }
+});
+
+test("source completion stays retryable when identity residue appears after public verification", async () => {
+  const { db, dir, a, b } = setup();
+  try {
+    grant(db, a);
+    setSourceGrant(db, {
+      source_key: b,
+      expected_revision: 0,
+      operation_id: "grant-b-identity-race",
+      policy: policy(),
+    });
+    const erased = accept(db, { ...event(), subjects: [{ subject_id: "person:erased", role: "about" }] }, {
+      source: { source_key: a, expected_revision: 1 },
+    });
+    const surviving = accept(db, { ...event(), source_record_id: "surviving-identity-race" }, {
+      source: { source_key: b, expected_revision: 1 },
+    });
+    if (erased.status !== "stored" || surviving.status !== "stored") throw new Error("fixture failed");
+    const port = bindLocalSourcePort(new FixtureVectorPort({ vector: false }), { store_id: "local:identity-race" });
+    const verify = port.verifyAbsent.bind(port);
+    let calls = 0;
+    port.verifyAbsent = async (ids) => {
+      const proof = await verify(ids);
+      calls += 1;
+      if (calls === 2) db.query(
+        `INSERT INTO identity_links
+         (subject_a, subject_b, score, evidence, status, decided_by, receipt_id, at)
+         VALUES (?, ?, ?, ?, ?, ?, NULL, ?)`,
+      ).run("person:erased", "person:residue", 1, JSON.stringify([`event:${surviving.event.event_id}`]), "candidate", "race", "2026-09-05T00:00:00.000Z");
+      return proof;
+    };
+    const options = {
+      retrieval: port,
+      ownedRetrieval: { stores: async () => ({ stores: [], absent_store_ids: [] }) },
+    };
+    revokeSourceGrant(db, { source_key: a, expected_revision: 1, operation_id: "identity-race" });
+    const pending = await resumeSourceRevocation(db, dir, "identity-race", options);
+    expect(calls).toBeGreaterThanOrEqual(2);
+    expect(pending.status).toBe("denied");
+    expect(pending.purge_blockers).toContain("identity_payload_retained");
+    expect(db.query("SELECT 1 FROM identity_links WHERE subject_a='person:erased'").get()).not.toBeNull();
+    db.query("DELETE FROM identity_links").run();
+    const done = await resumeSourceRevocation(db, dir, "identity-race", options);
+    expect(done.status).toBe("purged");
   } finally {
     db.close();
   }
@@ -774,7 +823,9 @@ test("a crashed rebuild releases kernel ownership and reopened source revocation
     const sourceModule = new URL("../src/index.ts", import.meta.url).pathname;
     const fixtureModule = new URL("./claims/helpers.ts", import.meta.url)
       .pathname;
-    const script = `import { openLedger, bindLocalSourcePort, rebuildRetrieval } from ${JSON.stringify(sourceModule)};
+    const dbModule = new URL("../src/ledger/db.ts", import.meta.url).pathname;
+    const script = `import { bindLocalSourcePort, rebuildRetrieval } from ${JSON.stringify(sourceModule)};
+      import { openLedger } from ${JSON.stringify(dbModule)};
       import { FixtureVectorPort } from ${JSON.stringify(fixtureModule)};
       const dir=${JSON.stringify(dir)};
       const db=openLedger(dir+'/.kizuki/kizuki.db');
@@ -848,6 +899,7 @@ test("native relayed corrections preserve owner origin and source closure across
   const principal = authenticate(
     db,
     addAgent(db, "source-relay", {
+      types: null, subjects: null,
       ceiling: "private",
       tools: ["correct"],
       relay_owner_corrections: true,
@@ -1106,6 +1158,19 @@ test("native source erasure removes whole joint claims and SQLite payload while 
   );
   if (!("claim" in joint) || !("claim" in independent))
     throw new Error("fixture claim failed");
+  db.query(
+    `INSERT INTO identity_links
+       (subject_a, subject_b, score, evidence, status, decided_by, receipt_id, at)
+     VALUES (?, ?, ?, ?, ?, ?, NULL, ?)`,
+  ).run(
+    "person:legacy-a",
+    "person:legacy-b",
+    1,
+    JSON.stringify([`event:${aa.event.event_id}`, `claim:${joint.claim.claim_id}`]),
+    "merged",
+    "forged",
+    "2026-09-05T00:00:00.000Z",
+  );
   await rebuildRetrieval(db, dir);
   expect(
     db
@@ -1132,6 +1197,7 @@ test("native source erasure removes whole joint claims and SQLite payload while 
   });
   expect(done.status).toBe("purged");
   expect(done.erasure?.affected_claim_ids).toContain(joint.claim.claim_id);
+  expect(db.query("SELECT 1 FROM identity_links").get()).toBeNull();
   expect(
     db
       .query(
@@ -1635,7 +1701,7 @@ test("compatibility erasure covers joint and rejected proposals, preserves indep
         provenance: string;
     }, [
         string
-    ]>("SELECT p.proposal_id,p.provenance FROM proposals p JOIN json_each(p.provenance) e JOIN source_event_bindings b ON b.event_id=e.value WHERE b.source_key=? ORDER BY p.proposal_id").all(a);
+    ]>("SELECT p.proposal_id,p.provenance FROM proposals p WHERE EXISTS (SELECT 1 FROM json_each(p.provenance) e JOIN source_event_bindings b ON b.event_id=e.value WHERE b.source_key=?) ORDER BY p.proposal_id").all(a);
     const bBefore = db.query("SELECT * FROM proposals WHERE provenance=?").get(JSON.stringify([bId]));
     // Compatibility history can contain every lifecycle state; source closure is independent of status.
     db.query("UPDATE proposals SET provenance=?,status='promoted' WHERE proposal_id=?").run(JSON.stringify([...JSON.parse(aRows[0]!.provenance), bId]), aRows[0]!.proposal_id);
@@ -1673,7 +1739,9 @@ test("native receipt creation is private under a permissive child-process umask"
   const core=join(import.meta.dir,"../src/index.ts");
   const helpers=join(import.meta.dir,"canon/helpers.ts");
   const fixtures=join(import.meta.dir,"fixtures.ts");
-  const code=`import {initVault,openLedger,accept} from ${JSON.stringify(core)};
+  const dbModule=join(import.meta.dir,"../src/ledger/db.ts");
+  const code=`import {initVault,accept} from ${JSON.stringify(core)};
+    import {openLedger} from ${JSON.stringify(dbModule)};
     import {write,storeClaim} from ${JSON.stringify(helpers)};
     import {validEvent} from ${JSON.stringify(fixtures)};
     import {lstatSync} from 'node:fs'; import {join} from 'node:path';

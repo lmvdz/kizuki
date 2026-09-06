@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { applyAgentsV9 } from "../src/agents/schema";
@@ -10,12 +10,19 @@ import { applyClaimsV3, initClaims } from "../src/claims/schema";
 import { neighbors } from "../src/graph/graph";
 import { initGraph } from "../src/graph/schema";
 import { applyConnectionsV8 } from "../src/ledger/connections-schema";
-import { openLedger } from "../src/ledger/db";
+import { LEDGER_SCHEMA_VERSION, openLedger } from "../src/ledger/db";
 import { tableExists } from "../src/ledger/schema";
 import { initSearch } from "../src/search/schema";
 import { searchResult } from "../src/search/query";
 import { accept, count } from "../src/ledger/ledger";
 import { validEvent } from "./fixtures";
+import { computeLegacyContentHash } from "../src/util/hash";
+
+const LEGACY_EVENT_HASH = computeLegacyContentHash({
+  schema: "kizuki.event/v1", connector_id: "fixture", source_record_id: "legacy",
+  kind: "message", occurred_at: "2026-01-01T00:00:00Z", observed_at: "2026-01-01T00:00:00Z",
+  text: "kept", subjects: [], deleted: false, attachments: [], metadata: {},
+});
 
 function schemaVersion(db: Database): number {
   return (
@@ -112,6 +119,24 @@ const V2_SCHEMA = `
 `;
 
 describe("openLedger migrations", () => {
+  test("keeps the existing one-second wait default and permits a bounded startup wait", () => {
+    const legacy = openLedger(":memory:"), contender = openLedger(":memory:", { busyTimeoutMs: 5000 });
+    try {
+      expect(legacy.query("PRAGMA busy_timeout").get()).toEqual({ timeout: 1000 });
+      expect(contender.query("PRAGMA busy_timeout").get()).toEqual({ timeout: 5000 });
+    } finally { legacy.close(); contender.close(); }
+  });
+
+  test("rejects invalid startup waits before creating a database", () => {
+    const root = mkdtempSync(join(tmpdir(), "kizuki-ledger-timeout-")), path = join(root, "ledger.db");
+    try {
+      for (const busyTimeoutMs of [-1, 5001, 1.5, NaN, Infinity, "5000"] as number[]) {
+        expect(() => openLedger(path, { busyTimeoutMs })).toThrow("invalid ledger busy timeout");
+        expect(existsSync(path)).toBe(false);
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   test("applies the current migrations and enables foreign keys", () => {
     const db = openLedger(":memory:");
     expect(schemaVersion(db)).toBeGreaterThanOrEqual(3);
@@ -128,6 +153,7 @@ describe("openLedger migrations", () => {
     ).toEqual(expect.arrayContaining([
       "canon_holds",
       "checkpoints",
+      "rail_cursors",
       "claim_bindings",
       "claim_supersessions",
       "claims",
@@ -239,7 +265,7 @@ describe("openLedger migrations", () => {
         INSERT INTO events VALUES (
           '01ARZ3NDEKTSV4RRFFQ69G5FAV', 'fixture', 'legacy', 'message',
           '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'kept', '[]',
-          NULL, 0, '[]', '{}', '${"a".repeat(64)}', '2026-01-01T00:00:00Z'
+          NULL, 0, '[]', '{}', '${LEGACY_EVENT_HASH}', '2026-01-01T00:00:00Z'
         );
         INSERT INTO promotions VALUES (
           'receipt-1', 'proposal-1', '["event-1"]', 'personal',
@@ -297,7 +323,7 @@ describe("openLedger migrations", () => {
         INSERT INTO events VALUES (
           '01ARZ3NDEKTSV4RRFFQ69G5FAV', 'fixture', 'legacy', 'message',
           '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'kept', '[]',
-          NULL, 0, '[]', '{}', '${"a".repeat(64)}', '2026-01-01T00:00:00Z'
+          NULL, 0, '[]', '{}', '${LEGACY_EVENT_HASH}', '2026-01-01T00:00:00Z'
         );
         INSERT INTO proposals VALUES (
           'proposal-live', 'claim', NULL, 'Ada works at Acme.', '{}',
@@ -316,7 +342,7 @@ describe("openLedger migrations", () => {
       legacy.close();
 
       const upgraded = openLedger(path);
-      expect(schemaVersion(upgraded)).toBe(15);
+      expect(schemaVersion(upgraded)).toBe(LEDGER_SCHEMA_VERSION);
       const tables = upgraded
         .query<{ name: string }, []>(
           "SELECT name FROM sqlite_master WHERE type = 'table'",
@@ -421,7 +447,7 @@ describe("openLedger migrations", () => {
         INSERT INTO events VALUES (
           '01ARZ3NDEKTSV4RRFFQ69G5FAV', 'fixture', 'legacy', 'message',
           '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'kept', '[]',
-          NULL, 0, '[]', '{}', '${"a".repeat(64)}', '2026-01-01T00:00:00Z'
+          NULL, 0, '[]', '{}', '${LEGACY_EVENT_HASH}', '2026-01-01T00:00:00Z'
         );
         INSERT INTO proposals VALUES (
           'proposal-created', 'entity', 'person:ada', 'Ada page.', '{}',
@@ -449,7 +475,7 @@ describe("openLedger migrations", () => {
       legacy.close();
 
       const upgraded = openLedger(path);
-      expect(schemaVersion(upgraded)).toBe(15);
+      expect(schemaVersion(upgraded)).toBe(LEDGER_SCHEMA_VERSION);
       const receipts = upgraded
         .query<
           {
@@ -575,8 +601,8 @@ describe("openLedger migrations", () => {
       legacy.close();
       const upgraded = openLedger(path);
       expect(columns(upgraded, "canon_receipts")).toEqual(freshColumns);
-      expect(schemaVersion(fresh)).toBe(15);
-      expect(schemaVersion(upgraded)).toBe(15);
+      expect(schemaVersion(fresh)).toBe(LEDGER_SCHEMA_VERSION);
+      expect(schemaVersion(upgraded)).toBe(LEDGER_SCHEMA_VERSION);
       expect(columns(fresh, "connector_sensitivity")).toEqual([
         "at",
         "connector_id",
@@ -614,7 +640,7 @@ describe("openLedger migrations", () => {
       legacy.close();
 
       const upgraded = openLedger(path);
-      expect(schemaVersion(upgraded)).toBe(15);
+      expect(schemaVersion(upgraded)).toBe(LEDGER_SCHEMA_VERSION);
       expect(
         upgraded
           .query<{ name: string }, []>(
@@ -702,7 +728,7 @@ describe("openLedger migrations", () => {
       legacy.close();
 
       const upgraded = openLedger(path);
-      expect(schemaVersion(upgraded)).toBe(15);
+      expect(schemaVersion(upgraded)).toBe(LEDGER_SCHEMA_VERSION);
       const grant = upgraded
         .query<
           { relay_owner_corrections: number; grant_epoch: number },
@@ -732,7 +758,7 @@ describe("openLedger migrations", () => {
       leftover.close();
 
       const upgraded = openLedger(path);
-      expect(schemaVersion(upgraded)).toBe(15);
+      expect(schemaVersion(upgraded)).toBe(LEDGER_SCHEMA_VERSION);
       const tables = upgraded
         .query<{ name: string }, []>(
           "SELECT name FROM sqlite_master WHERE type = 'table'",
@@ -775,7 +801,7 @@ describe("openLedger migrations", () => {
       leftover.close();
 
       const upgraded = openLedger(path);
-      expect(schemaVersion(upgraded)).toBe(15);
+      expect(schemaVersion(upgraded)).toBe(LEDGER_SCHEMA_VERSION);
       expect(
         upgraded
           .query<{ name: string }, [string]>("SELECT name FROM pragma_table_info(?)")
@@ -848,7 +874,7 @@ describe("openLedger migrations", () => {
       legacy.close();
 
       const upgraded = openLedger(path);
-      expect(schemaVersion(upgraded)).toBe(15);
+      expect(schemaVersion(upgraded)).toBe(LEDGER_SCHEMA_VERSION);
       expect(
         upgraded
           .query<{ name: string }, [string]>("SELECT name FROM pragma_table_info(?)")
@@ -879,7 +905,7 @@ describe("openLedger migrations", () => {
         { layer: "graph", status: "degraded" },
         { layer: "search", status: "degraded" },
       ]);
-      expect(searchResult(upgraded, "stale")).toEqual({
+      expect(searchResult(upgraded, "stale", { ceiling: "private" })).toEqual({
         hits: [],
         degraded: ["index-degraded"],
       });
@@ -929,8 +955,8 @@ describe("openLedger migrations", () => {
       first.close();
 
       const reopened = openLedger(path);
-      expect(schemaVersion(reopened)).toBe(15);
-      expect(searchResult(reopened, "kettleword")).toEqual({
+      expect(schemaVersion(reopened)).toBe(LEDGER_SCHEMA_VERSION);
+      expect(searchResult(reopened, "kettleword", { ceiling: "private" })).toEqual({
         hits: [
           expect.objectContaining({
             doc_id: "page:fact:tea",
@@ -972,7 +998,7 @@ describe("openLedger migrations", () => {
       first.close();
 
       const reopened = openLedger(path);
-      expect(searchResult(reopened, "kettleword")).toEqual({
+      expect(searchResult(reopened, "kettleword", { ceiling: "private" })).toEqual({
         hits: [],
         degraded: ["index-degraded"],
       });
@@ -1013,7 +1039,7 @@ describe("openLedger migrations", () => {
       first.close();
 
       const reopened = openLedger(path);
-      expect(schemaVersion(reopened)).toBe(15);
+      expect(schemaVersion(reopened)).toBe(LEDGER_SCHEMA_VERSION);
       expect(
         reopened
           .query<{ name: string }, [string]>(
