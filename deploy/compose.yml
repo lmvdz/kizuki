@@ -97,4 +97,4 @@ secrets:
   # a path with the same directory-then-file permission shape; it must
   # never point at a loosened copy of a key that lives somewhere else.
   ts_authkey:
-    file: ${KIZUKI_TS_AUTHKEY_FILE:?set KIZUKI_TS_AUTHKEY_FILE to the tailscale auth key file}
+    file: ${KIZUKI_TS_AUTHKEY_FILE:-./secrets/ts-authkey}

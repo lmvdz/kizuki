@@ -112,12 +112,45 @@ check_2_13() {
   pass 2.13 no-authkey-env
 }
 
+check_2_15() {
+  # The tailscale key path has been wrong twice, in opposite directions, and
+  # each was noticed only after it shipped:
+  #   - an absolute path under an operator's home directory, which AGENTS.md
+  #     forbids committing;
+  #   - `${VAR:?...}`, which makes every compose invocation require the
+  #     variable while only the two `up` calls set it, so `ps`, `exec`,
+  #     `logs`, `down` and `run` all failed.
+  # The default must be present, relative and impersonal. `up` still fails
+  # closed when the file is absent, which is the property that matters.
+  local line
+  line="$(grep -E '^[[:space:]]*file:[[:space:]]*\$\{KIZUKI_TS_AUTHKEY_FILE' "$COMPOSE" || true)"
+  if [ -z "$line" ]; then
+    fail 2.15 authkey-default-safe "no ts_authkey file: line interpolating KIZUKI_TS_AUTHKEY_FILE"
+  fi
+  case "$line" in
+    *':?'*)
+      fail 2.15 authkey-default-safe "mandatory \${VAR:?...} form breaks every compose command that is not 'up': $line" ;;
+  esac
+  case "$line" in
+    *'/home/'*|*'/Users/'*|*':-/'*|*':-~'*)
+      fail 2.15 authkey-default-safe "default must be relative and impersonal: $line" ;;
+  esac
+  case "$line" in
+    *':-'*) ;;
+    *)
+      fail 2.15 authkey-default-safe "no default supplied; a bare \${VAR} leaves non-'up' commands with an empty path: $line" ;;
+  esac
+  pass 2.15 authkey-default-safe
+}
+
+
 main() {
   check_2_1
   check_2_2
   check_2_3
   check_2_4
   check_2_5
+  check_2_15
   check_2_13
   # Every check passed. This line is the only positive signal a
   # truncated or piped read can rely on: judge a run by its
