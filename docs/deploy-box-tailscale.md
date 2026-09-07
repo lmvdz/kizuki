@@ -475,6 +475,27 @@ deploy/tailscale/entrypoint.sh` (this repository has `core.filemode=false`,
 so the bit had to be set in the index directly rather than relying on a
 local `chmod` to be picked up).
 
+Finding (2026-09-07, containment-verification lane, head `35eb13c`): re-ran
+`deploy/proof/tailnet.sh` end to end against this tree with no code changes
+needed to either `deploy/proof/tailnet.sh` or `deploy/box/bootstrap.sh` —
+the prior fix above already holds. `deploy/box/bootstrap.sh` provisioned a
+fresh Box VM (`bx_76u37ber`) with a tagged, reusable `ts-authkey`, reaching
+health in under 90s; the proof then ran from `lars-pc`'s own Tailscale
+identity, reached through WSL2 mirrored networking (the WSL guest shares
+`lars-pc`'s network namespace and its Tailscale interface directly, and
+`tailscale.exe status --self=false` from inside WSL confirms the box is a
+genuinely distinct peer, not a self-probe) — a variant of the same "real
+second tailnet node" the earlier finding used, recorded here since it is
+a different mechanism (Windows Tailscale reached via WSL interop rather
+than a native Linux or native Windows shell) and may be useful the next
+time this proof needs a peer. All eight checks passed again:
+`PASS 2.6 node-online`, `PASS 2.7 health-over-tailnet`,
+`PASS 2.8 mcp-over-tailnet`, `PASS 2.9 fail-closed-no-token`,
+`PASS 2.10 public-ip-dark`, `PASS 2.11 no-shell-exposed`,
+`PASS 2.12 restart-keeps-identity`, `PASS 2.14 only-served-ports-reachable`,
+`ALL CHECKS PASSED`, exit 0. The box created for this run was deleted and
+`GET /boxes` confirmed `{"boxes":[]}` immediately after.
+
 ### M3 Box golden snapshot and one-command setup
 
 Files: `deploy/box/bootstrap.sh`, `deploy/box/README.md`,
