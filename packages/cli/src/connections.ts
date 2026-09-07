@@ -146,12 +146,33 @@ export function connectorAuthModes(id: string): readonly string[] | null {
  * tokens, app passwords) into the same opaque connection-state store a
  * `none`-auth connector uses for plain config like a local path; core never
  * distinguishes the two, so a backup that copied every connector's state
- * bytes would put those secrets in the backup. Only the `none`-auth shape is
- * safe to carry across a backup.
+ * bytes would put those secrets in the backup.
+ *
+ * A connector whose only auth mode is `none` is unambiguous: every
+ * connection it can ever have is safe. A connector that also declares
+ * `sign_in` (today only `kizuki.ics`, over a local file or a public
+ * no-auth URL versus a private calendar URL) is not unambiguous at the
+ * connector level, but a specific enrolled connection can still be proven
+ * safe from what it actually stored: `decodeHostState` only ever accepts a
+ * bare `{path}` shape for a connector outside the small set this module
+ * already treats as opaque (imap, telegram, gmail, google-calendar bypass
+ * it entirely in `inspectConnection`; beeper's branch inside it always
+ * produces `{base_url, token_secret_ref}`). So a `state` that decoded to a
+ * `path` could only have been written by that connection's `none`-mode
+ * enrollment, never by a sign-in — this reads what was actually stored,
+ * not what the connector merely declares it could do. A caller with no
+ * decoded state (every other call site still uses the connector-only
+ * overload) gets the old, strictly conservative answer.
  */
-export function connectionStateIsCredentialFree(connectorId: string): boolean {
+export function connectionStateIsCredentialFree(
+  connectorId: string,
+  state?: HostConnectionState | null,
+): boolean {
   const modes = connectorAuthModes(connectorId);
-  return modes !== null && modes.length === 1 && modes[0] === "none";
+  if (modes === null || !modes.includes("none")) return false;
+  if (modes.length === 1) return true;
+  return state !== undefined && state !== null && "path" in state.config &&
+    typeof state.config.path === "string";
 }
 
 export function listEnrollableConnectorIds(): string[] {

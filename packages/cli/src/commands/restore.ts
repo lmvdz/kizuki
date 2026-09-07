@@ -3,17 +3,27 @@ import { join, resolve } from "node:path";
 import type { Database } from "bun:sqlite";
 import { listConnections, restoreVault, verifyBackup } from "@kizuki/core";
 import { UsageError, parseArguments } from "../args";
-import { connectionStateIsCredentialFree } from "../connections";
+import { connectionStateIsCredentialFree, decodeHostState } from "../connections";
 import { openVaultDb } from "../context";
 import { tryRefreshDerived } from "../derived";
 import type { CliIo, Command } from "./index";
 
 /**
  * The counterpart to `exportCredentialFreeConnectionState`: only a
- * `none`-auth connector ever had its state copied into the backup, so only
- * those connections can come back usable. Anything else keeps reporting
- * `state=missing` exactly as it did before this fix — re-enrollment, not a
- * silently trusted credential, is what a sign-in connector gets back.
+ * connection export judged credential-free ever had its state copied into
+ * the backup, so only those connections can come back usable. Anything
+ * else keeps reporting `state=missing` exactly as it did before this fix —
+ * re-enrollment, not a silently trusted credential, is what a sign-in
+ * connection gets back.
+ *
+ * The decision is re-derived here from the just-restored `connections`
+ * row and the raw bytes actually sitting in the backup directory —
+ * decoded fresh with `decodeHostState`, never trusted from anything the
+ * backup merely claims about itself. A row a tampered backup relabeled
+ * `kizuki.ics` still only comes back if the bytes next to it decode to a
+ * bare local path; the connector's own `sign_in` shape does not decode
+ * that way, so a copied session credential is never restored no matter
+ * what the surrounding rows say.
  */
 function restoreCredentialFreeConnectionState(
   db: Database,
@@ -22,7 +32,6 @@ function restoreCredentialFreeConnectionState(
 ): number {
   let restored = 0;
   for (const connection of listConnections(db, { includeDisconnected: true })) {
-    if (!connectionStateIsCredentialFree(connection.connector_id)) continue;
     const ref = connection.secret_refs[0];
     if (connection.secret_refs.length !== 1 || ref === undefined) continue;
     if (!ref.startsWith("file:connections/") || !ref.endsWith(".state")) continue;
@@ -30,6 +39,13 @@ function restoreCredentialFreeConnectionState(
     const from = join(backupDir, relative);
     if (!existsSync(from)) continue;
     const bytes = readFileSync(from);
+    let state;
+    try {
+      state = decodeHostState(bytes, connection.connector_id);
+    } catch {
+      continue;
+    }
+    if (!connectionStateIsCredentialFree(connection.connector_id, state)) continue;
     const to = join(into, ".kizuki", relative);
     writeFileSync(to, bytes, { mode: 0o600 });
     chmodSync(to, 0o600);

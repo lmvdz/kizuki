@@ -27,8 +27,12 @@ function countFile(
  * credential. A `none`-auth connector's state is never a credential — it is
  * the same plain config (e.g. a local path) `connections.jsonl` already
  * carries a reference to — so its bytes are safe to copy alongside the
- * backup core already wrote. This lives in the CLI, not core, because only
- * the CLI knows a connector's auth mode; core is connector-agnostic.
+ * backup core already wrote. A connector that can both sign in and run
+ * without auth (`kizuki.ics`) is judged per connection, from its decoded
+ * state, not from the connector as a whole — see
+ * `connectionStateIsCredentialFree`. This lives in the CLI, not core,
+ * because only the CLI knows a connector's auth mode; core is
+ * connector-agnostic.
  */
 function exportCredentialFreeConnectionState(
   ctx: VaultContext,
@@ -37,7 +41,7 @@ function exportCredentialFreeConnectionState(
   let copied = 0;
   for (const host of listHostConnections(ctx.db, ctx.store)) {
     if (host.state === null) continue;
-    if (!connectionStateIsCredentialFree(host.connection.connector_id)) continue;
+    if (!connectionStateIsCredentialFree(host.connection.connector_id, host.state)) continue;
     const ref = host.connection.secret_refs[0];
     if (host.connection.secret_refs.length !== 1 || ref === undefined) continue;
     const bytes = ctx.store.read(host.connection);
